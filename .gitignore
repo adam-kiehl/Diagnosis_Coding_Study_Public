@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Mac files
+.DS_Store
+
+# Model states
+fine_tuned/*.pkl
+
+# Concept relationship table
+CONCEPT_RELATIONSHIP.csv
+
+# Data
+records_df*
+
+# R
+*.Rhistory
+
+# Model predictions
+analysis/gatortron_predictions.json
