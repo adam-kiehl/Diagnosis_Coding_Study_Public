@@ -665,7 +665,7 @@ p_jaccard_hist <- ggplot(jaccard_hist_df, aes(x = jaccard_avg, fill = Group)) +
   ) +
   scale_fill_viridis_d(end = 0.9, option = "C") +
   labs(
-    title = "Inter-Coder Reliability",
+    # title = "Inter-Coder Reliability",
     # subtitle = "per record x group",
     # subtitle = "Faceted by AI usage; dashed line indicates mean within facet",
     x = "Jaccard Index",
@@ -762,7 +762,7 @@ p2 <- ggplot(coding_speed_df, aes(x = order, y = time, color = Group)) +
   ) +
   scale_color_viridis_d(end = 0.9, option = "C") +
   labs(
-    title = "Coding Speed Over Time",
+    # title = "Coding Speed Over Time",
     # subtitle = "Log-scaled time; dashed line indicates mean within facet",
     x = "Coding Order",
     y = "Coding Time [seconds, log scale]",
