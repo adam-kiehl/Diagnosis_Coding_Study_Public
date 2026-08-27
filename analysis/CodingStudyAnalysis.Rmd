@@ -38,7 +38,7 @@ Imports the coding records, reports their structure, removes unused columns, and
 ```{r import-records}
 # Read, inspect, reduce, and completeness-filter the primary record-level dataset.
 # 1) Import the CSV
-raw_data <- readr::read_csv("../data_entry/records_df_done.csv", show_col_types = FALSE)
+raw_data <- readr::read_csv("../data_entry/records_df.csv", show_col_types = FALSE)
 
 # 2) Print a summary including column dtypes and total number of rows
 cat("=== DataFrame Summary ===\n")
@@ -365,6 +365,7 @@ Summarizes coding-time means and standard deviations by coder group.
 records_long %>%
   group_by(group) %>%
   summarize(mean(time),
+            median(time),
             sd(time))
 ```
 
@@ -375,6 +376,7 @@ Summarizes coding-time means and standard deviations by AI-use condition.
 records_long %>%
   group_by(ai) %>%
   summarize(mean(time),
+            median(time),
             sd(time))
 ```
 
@@ -611,13 +613,13 @@ jaccard_hist_df <- jaccard_by_record_group %>%
   rename(`AI Use` = ai, Group = group) %>%
   mutate(
     `AI Use` = case_when(
-      `AI Use` == TRUE  ~ "AI Used",
+      `AI Use` == TRUE  ~ "AI-Assisted Coding",
       `AI Use` == FALSE ~ "Manual Coding",
       TRUE              ~ NA_character_
     ),
     Group = toupper(Group),
     # Nice ordering & stable legend
-    `AI Use` = factor(`AI Use`, levels = c("Manual Coding", "AI Used"))
+    `AI Use` = factor(`AI Use`, levels = c("Manual Coding", "AI-Assisted Coding"))
   ) %>%
   filter(!is.na(`AI Use`), !is.na(Group), !is.na(jaccard_avg))
 
@@ -713,21 +715,21 @@ coding_speed_df <- records_long %>%
   rename(`AI Use` = ai) %>%
   mutate(
     `AI Use` = case_when(
-      `AI Use` == TRUE  ~ "AI Used",
+      `AI Use` == TRUE  ~ "AI-Assisted Coding",
       `AI Use` == FALSE ~ "Manual Coding",
       TRUE              ~ NA_character_
     )
   ) %>%
   rename(Group = group) %>%
   mutate(Group = toupper(Group)) %>%
-  mutate(`AI Use` = factor(`AI Use`, levels = c("Manual Coding", "AI Used")))
+  mutate(`AI Use` = factor(`AI Use`, levels = c("Manual Coding", "AI-Assisted Coding")))
 
 coding_speed_hline_df <- coding_speed_df %>%
   group_by(`AI Use`) %>%
   summarise(mean_time = mean(time , na.rm = TRUE))
 
 p2 <- ggplot(coding_speed_df, aes(x = order, y = time, color = Group)) +
-  geom_point(alpha = 0.2, size = 1.2) +
+  geom_point(alpha = 0.05, size = 1.2) +
   geom_smooth(method = "lm",
               se = FALSE,
               linewidth = 1) +
