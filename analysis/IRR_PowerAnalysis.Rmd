@@ -1,627 +1,688 @@
 ---
-title: "ICR_PowerAnalysis"
+title: "ICR Power Analysis"
 author: "Adam Kiehl"
 date: "2025-10-15"
-output: pdf_document
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 
 library(tidyverse)
-library(jaccard)
 library(lme4)
 library(lmerTest)
+library(glmmTMB)
+library(emmeans)
+library(glue)
+library(scales)
 ```
 
-```{r}
-# Set simulation size per N
+# Overview
+
+This document estimates power across a range of record counts for four prespecified questions:
+
+1. Does marginal Jaccard agreement differ between AI-assisted and manual coding?
+2. Do marginal Jaccard agreement values differ among coder groups?
+3. Does marginal coding time differ between AI-assisted and manual coding?
+4. Does coding time differ among coder groups?
+
+The simulation assumptions remain pre-hoc. The fitted models and inferential targets match the study analysis:
+
+- Jaccard agreement is simulated directly at the record-by-group level and analyzed with a beta mixed-effects model.
+- Coding time is analyzed on the log scale with coder and record random intercepts.
+- Both fitted models include the AI-by-group interaction and adjust for text length.
+- The time model also adjusts for the uncentered global coding order within coder.
+- Marginal contrasts are obtained with `emmeans`; Tukey-adjusted p-values are used for the three Jaccard group comparisons.
+- The plots retain the record-count sensitivity-curve approach and mark 500 records as a reference only.
+
+# Shared settings and helper functions
+
+```{r shared-settings}
+# Monte Carlo settings
 reps <- 1000
-# Maximum sample size
+alpha <- 0.05
 N_min <- 10
 N_max <- 600
 steps <- 10
+N_grid <- seq(N_min, N_max, by = steps)
+reference_N <- 500
+
+# Reproducibility
+set.seed(42)
+
+# Actual coder roster: 3 clinicians, 2 coders, and 3 students.
+coder_roster <- tibble::tribble(
+  ~coder_id, ~group,
+  "Clinician_1", "Clinician",
+  "Clinician_2", "Clinician",
+  "Clinician_3", "Clinician",
+  "Coder_1", "Coder",
+  "Coder_2", "Coder",
+  "Student_1", "Student",
+  "Student_2", "Student",
+  "Student_3", "Student"
+) |>
+  mutate(
+    group = factor(group, levels = c("Clinician", "Coder", "Student"))
+  )
+
+# Pre-hoc record-level text-length distribution. Values are not centered.
+text_length_mean <- 1500
+text_length_sd <- 1000
+text_length_min <- 25
+
+simulate_text_length <- function(N) {
+  pmax(
+    round(rnorm(N, mean = text_length_mean, sd = text_length_sd)),
+    text_length_min
+  )
+}
+
+# Assign AI/manual condition as evenly as possible, including for odd N.
+assign_condition <- function(N) {
+  n_ai <- floor(N / 2)
+  n_manual <- N - n_ai
+
+  sample(c(rep("AI", n_ai), rep("Manual", n_manual))) |>
+    factor(levels = c("Manual", "AI"))
+}
+
+clip01 <- function(x, eps = 1e-6) {
+  pmin(pmax(x, eps), 1 - eps)
+}
+
+# Common plot annotations.
+add_power_references <- function(plot_object) {
+  plot_object +
+    geom_hline(
+      yintercept = 0.80,
+      linetype = "dashed",
+      color = "red"
+    ) +
+    geom_vline(
+      xintercept = reference_N,
+      linetype = "dotted",
+      color = "grey35"
+    ) +
+    annotate(
+      "text",
+      x = reference_N,
+      y = 0.03,
+      label = "500 records",
+      angle = 90,
+      hjust = 0,
+      vjust = -0.4,
+      color = "grey35",
+      size = 3.5
+    ) +
+    scale_y_continuous(
+      limits = c(0, 1),
+      labels = scales::percent_format(accuracy = 1)
+    ) +
+    theme_minimal(base_size = 12)
+}
+
+# Report the first grid value at which a power curve reaches 80%.
+report_minimum_N <- function(results, question_label) {
+  results |>
+    group_by(across(any_of("contrast"))) |>
+    summarise(
+      minimum_N = if (any(power >= 0.80, na.rm = TRUE)) {
+        min(N[power >= 0.80], na.rm = TRUE)
+      } else {
+        NA_integer_
+      },
+      .groups = "drop"
+    ) |>
+    mutate(question = question_label, .before = 1)
+}
 ```
 
-### Question 1: Between-Coder Group ICR
+# Jaccard agreement simulation
 
-Does inter-coder reliability vary significantly between coder groups (student, clinician, coder)?
+## Model and assumptions
 
-\begin{align}
-Y_{r,g} &= \beta_0 
-+ \beta_{\text{AI}} \cdot \mathbf{1}\{\text{Cond}_r = \text{AI}\}
-+ \beta_{\text{Student}} \cdot \mathbf{1}\{g = \text{Student}\}
-+ \beta_{\text{Clinician}} \cdot \mathbf{1}\{g = \text{Clinician}\} \\
-&\quad
-+ \beta_{\text{AI}\times\text{Student}} \cdot \mathbf{1}\{\text{Cond}_r = \text{AI}\} \cdot \mathbf{1}\{g = \text{Student}\}
-+ \beta_{\text{AI}\times\text{Clinician}} \cdot \mathbf{1}\{\text{Cond}_r = \text{AI}\} \cdot \mathbf{1}\{g = \text{Clinician}\} \\
-&\quad
-+ u_r + \varepsilon_{r,g}, \\
-u_r &\sim \mathcal{N}(0,\sigma^2_{\text{record}}) \\
-\varepsilon_{r,g} &\sim \mathcal{N}(0,\sigma^2).
-\end{align}
+For record $r$ and coder group $g$, the simulation generates one mean pairwise Jaccard outcome directly:
 
-```{r}
-# Q1 POWER: Group effect on ICR (mean pairwise Jaccard per record×group)
-# Design: 3 groups, 2 coders/group (=> one Jaccard per record×group), N records, 50% records AI (record-level).
-# Model: logit(ICR) ~ Group + Condition + Group×Condition + (1|Record)
-# Test: Group main effect (Type III). Alpha = 0.05. Power across N = 10..300 by 10.
-# --------------------------------------------------------------------
-# This script estimates statistical power (probability of detecting a true effect)
-# for the hypothesis "Group main effect does not equal 0" in a mixed-effects model where the outcome
-# is the logit-transformed inter-coder reliability (ICR; Jaccard index).
-# We simulate many synthetic datasets for each N, fit the model, record the p-value
-# for the group main effect, and compute power as the proportion of p-values < alpha.
-# --------------------------------------------------------------------
+\[
+Y_{rg} \sim \operatorname{Beta}(\mu_{rg}\phi, (1-\mu_{rg})\phi),
+\]
 
-# Set random seed
-set.seed(42)  # Ensures reproducibility of the random simulation results across runs
+with
 
-# ---- ASSUMPTIONS ----
-alpha <- 0.05  # Target significance level for hypothesis testing
-N_grid <- seq(N_min, N_max, by = steps)  # Range of total records to evaluate power over
+\[
+\operatorname{logit}(\mu_{rg}) =
+\operatorname{logit}(p_{rg}) + \beta_L L_r + u_r,
+\qquad
+u_r \sim N(0, \sigma^2_{record}).
+\]
 
-# Baseline ICR means (Manual) by group on the probability scale (Jaccard in [0,1])
-mu_manual <- c(Student   = 0.58,  # Expected mean ICR for Students under Manual condition
-               Clinician = 0.60,  # Expected mean ICR for Clinicians under Manual condition
-               Coder     = 0.62)  # Expected mean ICR for Coders under Manual condition
-# These encode the size of the "group difference" signal you want to detect.
+Here, $p_{rg}$ is the prespecified group- and condition-specific mean before the record random effect, $L_r$ is the uncentered text length, and $\phi$ is the beta precision parameter. The pre-hoc script did not specify a text-length effect, so `beta_text_jaccard` is set to zero during data generation while text length remains in the fitted model.
 
-# AI lift on ICR (absolute difference on probability scale), applied equally across groups for Q1 power.
-# Set to 0 here, because Q1 focuses on *group* differences, not AI.
-delta_AI <- 0.00  # No AI effect when assessing power for the group main effect
+The same boundary adjustment used in the study analysis is applied after simulation:
 
-# Record random intercept SD on *logit* scale (captures across-record difficulty shared by groups)
-sd_record <- 0.50
-# Larger sd_record => greater between-record variability in ICR across all groups,
-# which generally makes detecting fixed effects harder.
+\[
+Y^* = \frac{Y(n-1)+0.5}{n},
+\]
 
-# Beta concentration (phi). Larger => less dispersion around the mean.
+where $n$ is the number of record-by-group observations in that simulated dataset.
+
+Each simulated dataset is fitted with:
+
+```r
+jaccard_beta ~ condition * group + text_length + (1 | record)
+```
+
+using `glmmTMB(..., family = beta_family(link = "logit"))`.
+
+```{r jaccard-assumptions}
+# Pre-hoc manual-condition Jaccard means.
+mu_manual <- c(
+  Student = 0.58,
+  Clinician = 0.60,
+  Coder = 0.62
+)
+
+# Pre-hoc beta-model assumptions.
+sd_record_jaccard <- 0.50
 phi <- 1.5
-# We simulate ICR values using a Beta distribution around the mean ICR for a record×group.
-# phi is the precision parameter: higher phi => tighter (less variable) ICR around the mean.
+beta_text_jaccard <- 0
+```
 
-# ---- Helper functions ----
-logit  <- function(p) qlogis(p)  # Convenience alias for logit transform: log(p/(1-p))
-invlog <- function(x) plogis(x)  # Inverse-logit: maps real numbers back to (0,1)
-clip01 <- function(x, eps = 1e-6) pmin(pmax(x, eps), 1 - eps)  # Avoid exact 0 or 1 (numerical stability)
+## One Jaccard data-generating function
 
-simulate_once <- function(N) {
-  # Randomly assign half the records to AI
-  cond <- sample(rep(c("AI", "Manual"), each = N / 2), size = N, replace = FALSE)
-  # Ensure near-balance
-  if (abs(sum(cond=="AI") - N/2) > 2) {
-    # mild re-balance
-    cond[1:floor(N/2)] <- "AI"; cond[(floor(N/2)+1):N] <- "Manual"
-    cond <- sample(cond)
-  }
-  # ^ The block above assigns each of the N records to a condition (AI or Manual),
-  # trying to keep them roughly 50/50. Condition is at the RECORD level (all groups share it).
+```{r jaccard-functions}
+simulate_jaccard_data <- function(N, delta_AI) {
+  record_data <- tibble(
+    record = factor(seq_len(N)),
+    condition = assign_condition(N),
+    text_length = simulate_text_length(N),
+    u_record = rnorm(N, mean = 0, sd = sd_record_jaccard)
+  )
 
-  # Record random intercept (shared across groups)
-  u_rec <- rnorm(N, 0, sd_record)
-  # ^ u_rec captures record-specific difficulty on the LOGIT scale. It is the same for all groups
-  # within a record, inducing correlation among the three group rows for each record.
-
-  # For each record×group, generate ICR via Beta with mean shifted by u_rec on logit scale
-  out <- expand.grid(record = seq_len(N),
-                     group  = c("Student","Clinician","Coder"),
-                     KEEP.OUT.ATTRS = FALSE) |>
-    dplyr::mutate(condition = cond[record]) |>
-    rowwise() |>
+  out <- tidyr::crossing(
+    record = factor(seq_len(N), levels = levels(record_data$record)),
+    group = factor(
+      c("Clinician", "Coder", "Student"),
+      levels = c("Clinician", "Coder", "Student")
+    )
+  ) |>
+    left_join(record_data, by = "record") |>
     mutate(
-      p_manual = mu_manual[group],                    # Baseline manual mean for this group (probability scale)
-      p_mean   = ifelse(condition=="AI", p_manual + delta_AI, p_manual),  # Add AI lift (0 for Q1)
-      p_mean   = clip01(p_mean),                      # Keep within (0,1) bounds
-      eta      = logit(p_mean) + u_rec[record],       # Shifted mean on LOGIT scale by record difficulty
-      p_star   = invlog(eta),                         # Back to probability scale after adding u_rec
-      a        = p_star * phi,                        # Beta shape parameter alpha = mu·phi
-      b        = (1 - p_star) * phi,                  # Beta shape parameter beta = (1-mu)·phi
-      ICR      = rbeta(1, a, b),                      # Draw a simulated ICR for this record×group
-      ICR      = clip01(ICR, 1e-6),                   # Guard against exact 0 or 1
-      y        = logit(ICR)                           # Outcome for modeling: logit(ICR)
+      p_manual = unname(mu_manual[as.character(group)]),
+      p_mean = if_else(
+        condition == "AI",
+        p_manual + delta_AI,
+        p_manual
+      ),
+      p_mean = clip01(p_mean),
+      eta = qlogis(p_mean) +
+        beta_text_jaccard * text_length +
+        u_record,
+      mu = plogis(eta),
+      shape1 = mu * phi,
+      shape2 = (1 - mu) * phi,
+      jaccard_avg = rbeta(n(), shape1 = shape1, shape2 = shape2)
+    )
+
+  # Match the main analysis boundary adjustment exactly.
+  n_jaccard <- nrow(out)
+
+  out |>
+    mutate(
+      jaccard_beta =
+        (jaccard_avg * (n_jaccard - 1) + 0.5) / n_jaccard
     ) |>
-    ungroup()
-
-  # Fit LMM on logit(ICR)
-  fit <- suppressMessages(suppressWarnings(lmer(y ~ condition * group + (1|record), data = out, REML = TRUE)))
-  # ^ Mixed model:
-  #   - Fixed effects: condition (AI vs Manual), group (3 levels), and their interaction
-  #   - Random intercept: (1|record) to account for record-level correlation across groups
-  #   - Outcome: logit-transformed ICR
-
-  # Type III test for group main effect
-  an <- anova(fit, type = 3)  # from lmerTest
-  p_group <- an["group","Pr(>F)"]  # Extract p-value for the group main effect (our target for Q1 power)
-  return(p_group)  # Return the p-value for this one simulated dataset
+    select(record, condition, group, text_length, jaccard_avg, jaccard_beta)
 }
 
-# ---- Run simulations across N ----
-res <- lapply(N_grid, function(N) {
-  pvals <- replicate(reps, simulate_once(N))  # Repeat the simulate-fit-test cycle 'reps' times for each N
-  tibble(N = N, power = mean(pvals < alpha, na.rm = TRUE))  # Power = proportion of p-values < alpha
-}) |> bind_rows()
-# ^ 'res' now contains, for each N, the estimated power to detect a group main effect,
-#   given the assumptions above (means, variances, distributional choices, etc.).
+fit_jaccard_model <- function(data) {
+  glmmTMB::glmmTMB(
+    jaccard_beta ~ condition * group + text_length + (1 | record),
+    family = glmmTMB::beta_family(link = "logit"),
+    data = data
+  )
+}
 
-# ---- Plot and print minimal N for 80% power ----
-p <- ggplot(res, aes(N, power)) +
-  geom_line(color = "#2c7fb8", linewidth = 1) +             # Power curve over N
-  geom_hline(yintercept = 0.80, linetype = "dashed", color = "red") +  # 80% target line
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +  # Show y-axis as percentages
-  labs(title = "Q1 Power: Detecting Group Differences in ICR",
-       x = "Number of records (N)",
-       y = expression(Power ~ (alpha == 0.05))) +
-  theme_minimal(base_size = 12)
-print(p)  # Display the power curve
+# Q2 target: three coder-group comparisons averaged over condition.
+# Tukey adjustment is applied to the family of three comparisons.
+extract_jaccard_group_pvalues <- function(fit) {
+  emm_group <- emmeans::emmeans(fit, ~group, type = "response")
 
-minN <- res |> filter(power >= 0.80) |> slice_head(n=1)
-# ^ Identify the smallest N on our grid whose estimated power meets/exceeds 80%.
+  emmeans::contrast(
+    emm_group,
+    method = "pairwise",
+    adjust = "tukey"
+  ) |>
+    summary() |>
+    as.data.frame() |>
+    transmute(
+      contrast = as.character(contrast),
+      p_value = p.value
+    )
+}
 
-if (nrow(minN)==0) {
-  message("No N in grid reached 80% power. Increase N or effect size or reps.")
-  # ^ If nothing hits 80% within the current grid and assumptions, we suggest increasing N,
-  #   the effect size (i.e., widening group differences in mu_manual), or the number of reps
-  #   (to reduce Monte Carlo error in the estimate).
-} else {
-  print(glue::glue("Smallest N with greater than 80% power (Q1): N = {minN$N}, estimated power = {scales::percent(minN$power, accuracy=0.1)}"))
-  # ^ Report the smallest N achieving the target and the corresponding estimated power.
+# Q1 target: one AI-versus-manual comparison averaged over coder groups.
+extract_jaccard_ai_pvalue <- function(fit) {
+  emm_condition <- emmeans::emmeans(
+    fit,
+    ~condition,
+    type = "response"
+  )
+
+  emmeans::contrast(
+    emm_condition,
+    method = "pairwise",
+    adjust = "none"
+  ) |>
+    summary() |>
+    as.data.frame() |>
+    pull(p.value) |>
+    first()
+}
+
+# One simulation wrapper is used by both Jaccard questions.
+run_jaccard_once <- function(N, delta_AI, target = c("group", "AI")) {
+  target <- match.arg(target)
+
+  tryCatch(
+    {
+      data <- simulate_jaccard_data(N = N, delta_AI = delta_AI)
+      fit <- suppressMessages(suppressWarnings(fit_jaccard_model(data)))
+
+      if (target == "group") {
+        extract_jaccard_group_pvalues(fit)
+      } else {
+        extract_jaccard_ai_pvalue(fit)
+      }
+    },
+    error = function(e) {
+      if (target == "group") {
+        tibble(
+          contrast = c(
+            "Clinician - Coder",
+            "Clinician - Student",
+            "Coder - Student"
+          ),
+          p_value = NA_real_
+        )
+      } else {
+        NA_real_
+      }
+    }
+  )
 }
 ```
 
-### Question 2: Between- AI Group ICR
+# Question 1: AI effect on Jaccard agreement
 
-Does inter-coder reliability vary significantly between with- and without-AI coder groups?
+Does marginal Jaccard agreement differ between AI-assisted and manual coding? The target is the AI-versus-manual contrast averaged equally over coder groups, matching `emmeans(fit, ~ condition, type = "response")` followed by `pairs()`.
 
-\begin{align}
-Y_{r,g} &= \beta_0 
-+ \beta_{\text{AI}} \cdot \mathbf{1}\{\text{Cond}_r = \text{AI}\}
-+ \beta_{\text{Student}} \cdot \mathbf{1}\{g = \text{Student}\}
-+ \beta_{\text{Clinician}} \cdot \mathbf{1}\{g = \text{Clinician}\} \\
-&\quad
-+ \beta_{\text{AI}\times\text{Student}} \cdot \mathbf{1}\{\text{Cond}_r = \text{AI}\} \cdot \mathbf{1}\{g = \text{Student}\}
-+ \beta_{\text{AI}\times\text{Clinician}} \cdot \mathbf{1}\{\text{Cond}_r = \text{AI}\} \cdot \mathbf{1}\{g = \text{Clinician}\} \\
-&\quad
-+ u_r + \varepsilon_{r,g}, \\
-u_r &\sim \mathcal{N}(0,\sigma^2_{\text{record}}) \\
-\varepsilon_{r,g} &\sim \mathcal{N}(0,\sigma^2).
-\end{align}
+```{r q1-power}
+q1_results <- purrr::map_dfr(N_grid, function(N) {
+  p_values <- replicate(
+    reps,
+    run_jaccard_once(
+      N = N,
+      delta_AI = 0.05,
+      target = "AI"
+    )
+  )
 
-```{r}
-# Q2 POWER: AI vs Manual effect on ICR (across-records)
-# Same data-generating mechanism as Q1, but now delta_AI != 0 and the test is for the condition main effect.
-# ----------------------------------------------------------------------------------------------
-# GOAL (plain English):
-#   Estimate the statistical power to detect an AI effect on inter-coder reliability (ICR),
-#   measured via the Jaccard index, when AI vs Manual is assigned at the RECORD level.
-#
-# DESIGN IN THIS SIMULATION:
-#   * 3 coder groups (Student, Clinician, Coder); 2 coders per group in the study design.
-#   * For ICR, the analysis unit is record × group; with 2 coders/group this is a single pairwise Jaccard.
-#   * Each record is assigned to exactly one condition for everyone (AI or Manual).
-#   * The model includes a random intercept for record to account for difficulty differences across records.
-#
-# WHAT "POWER" MEANS HERE:
-#   For each N (number of records), we simulate many datasets, fit the model, and record the p-value
-#   for the condition (AI vs Manual) main effect. Power = proportion of simulated p-values < alpha.
-# ----------------------------------------------------------------------------------------------
+  tibble(
+    N = N,
+    power = mean(p_values < alpha, na.rm = TRUE)
+  )
+})
 
-# Set random seed
-set.seed(42)  # Ensures reproducibility: the same random draws each time you run the script
-
-# ---- ASSUMPTIONS TO SET ----
-alpha <- 0.05  # Significance threshold for the hypothesis test (Pr(>F) < 0.05 => reject H0)
-N_grid <- seq(N_min, N_max, by = steps)  # Sequence of record counts N over which to evaluate power
-
-# Baseline Manual ICR means by group (probability scale)
-mu_manual <- c(Student   = 0.58,  # Expected mean ICR for Students when condition = Manual
-               Clinician = 0.60,  # Expected mean ICR for Clinicians when condition = Manual
-               Coder     = 0.62)  # Expected mean ICR for Coders when condition = Manual
-# These encode the group differences you expect BEFORE any AI effect is applied.
-
-# AI lift on ICR (absolute on prob scale)
-# Consider trying a grid like +0.03, +0.05, +0.10 in separate runs.
-delta_AI <- 0.05   # Absolute increase in mean ICR under AI vs Manual
-sd_record <- 0.50  # logit-scale SD for record intercept (captures across-record difficulty variability)
-phi <- 1.5          # Beta concentration (precision); larger phi => less dispersion around the mean ICR
-# Notes:
-#   * sd_record inflates or reduces differences among records (shared by all groups on that record).
-#   * phi controls how tightly simulated ICR values cluster around their mean (on the probability scale).
-
-logit  <- function(p) qlogis(p); invlog <- function(x) plogis(x)  # Helper transforms: logit and inverse logit
-clip01 <- function(x, eps = 1e-6) pmin(pmax(x, eps), 1 - eps)     # Prevent exact 0 or 1 (avoid infinite logits)
-
-simulate_once <- function(N) {
-  # Assign conditions to records in a (near) balanced way so both AI and Manual appear.
-  # Each record's condition is shared by all three groups for that record.
-  cond <- sample(rep(c("AI", "Manual"), each = N / 2), size = N, replace = FALSE)
-
-  # Draw a record-level random intercept u_rec ~ N(0, sd_record^2) on the LOGIT scale.
-  # This represents latent difficulty or other record-specific factors that shift ICR for all groups.
-  u_rec <- rnorm(N, 0, sd_record)
-
-  # Build the record × group dataset, then simulate ICR values from a Beta distribution:
-  #   1) Compute the group- and condition-specific mean ICR for each row (probability scale).
-  #   2) Shift that mean by the record random effect on the LOGIT scale.
-  #   3) Convert back to probability to get the Beta mean (p_star).
-  #   4) Use phi to set the Beta's precision (a = p_star*phi, b = (1-p_star)*phi).
-  out <- expand.grid(record = seq_len(N),
-                     group  = c("Student","Clinician","Coder"),
-                     KEEP.OUT.ATTRS = FALSE) |>
-    dplyr::mutate(condition = cond[record]) |>
-    rowwise() |>
-    mutate(
-      p_manual = mu_manual[group],                         # Baseline ICR (Manual) for this group
-      p_mean   = ifelse(condition=="AI", p_manual + delta_AI, p_manual),  # Apply AI lift if AI
-      p_mean   = clip01(p_mean),                           # Keep the mean strictly within (0,1)
-      eta      = logit(p_mean) + u_rec[record],            # Add record-level shift on the LOGIT scale
-      p_star   = invlog(eta),                              # Back to probability scale after shift
-      a        = p_star * phi,                             # Beta shape alpha = mu·phi
-      b        = (1 - p_star) * phi,                       # Beta shape beta = (1-mu)·phi
-      ICR      = rbeta(1, a, b),                           # Simulated ICR draw for this record×group
-      ICR      = clip01(ICR, 1e-6),                        # Guard against exact 0/1 (numerical stability)
-      y        = logit(ICR)                                # Model outcome: logit(ICR)
-    ) |>
-    ungroup()
-
-  # Fit the linear mixed model (Gaussian LMM) on the logit-transformed ICR:
-  #   Fixed: condition + group + condition:group
-  #   Random: (1 | record) to capture correlation among group rows for the same record
-  fit <- suppressMessages(suppressWarnings(lmer(y ~ condition + group + condition:group + (1|record),
-                               data = out, REML = TRUE)))
-  
-  # p-value for condition main effect (AI vs Manual), from a Type III ANOVA table
-  an <- anova(fit, type = 3)
-  p_cond <- an["condition","Pr(>F)"]
-  return(p_cond)  # Return the p-value for this simulated dataset
-}
-
-# For each N in N_grid, run 'reps' simulated datasets, fit the model, and compute power as
-# the proportion of p-values for the condition effect that are < alpha.
-res <- lapply(N_grid, function(N) {
-  pvals <- replicate(reps, simulate_once(N))              # Vector of p-values across replicates
-  tibble(N = N, power = mean(pvals < alpha, na.rm = TRUE))# Estimated power at this N
-}) |> bind_rows()
-
-# Plot power vs N with a horizontal line at the 80% target level
-p <- ggplot(res, aes(N, power)) +
+q1_plot <- ggplot(q1_results, aes(x = N, y = power)) +
   geom_line(color = "#2c7fb8", linewidth = 1) +
-  geom_hline(yintercept = 0.80, linetype = "dashed", color = "red") +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-  labs(title = "Q2 Power: Detecting AI vs Manual Differences in ICR",
-       x = "Number of records (N)",
-       y = expression(Power ~ (alpha == 0.05))) +
-  theme_minimal(base_size = 12)
-print(p)  # Display the power curve
+  labs(
+    title = "Q1 Power: AI vs Manual Difference in Jaccard Agreement",
+    subtitle = "Marginal AI contrast averaged over coder groups",
+    x = "Number of records (N)",
+    y = expression(Power ~ (alpha == 0.05))
+  )
 
-# Identify and report the smallest N on our grid that achieves at least 80% power
-minN <- res |> filter(power >= 0.80) |> slice_head(n=1)
-if (nrow(minN)==0) {
-  message("No N in grid reached 80% power. Increase N or effect size or reps.")
-  # If nothing reaches 80%, consider:
-  #   * Increasing N (more records),
-  #   * Assuming a larger AI effect (delta_AI),
-  #   * Increasing 'reps' to reduce Monte Carlo uncertainty in the power estimate.
-} else {
-  print(glue::glue("Smallest N with greater than 80% power (Q2): N = {minN$N}, estimated power = {scales::percent(minN$power, accuracy=0.1)}"))
-  # Reports the minimal N achieving the target and the corresponding estimated power.
-}
-
-# ----------------------------------------------------------------------------------------------
-# PRACTICAL NOTES (for stakeholders):
-# * "Across-records": Because each record is assigned to exactly one condition (AI or Manual),
-#   the AI effect is identified by comparing ICR across the set of AI records vs the set of Manual records,
-#   while the random intercept (1|record) absorbs some record difficulty variation shared across groups.
-# * 'phi' (precision) and 'sd_record' (record-level variability) materially influence power:
-#   higher variability -> lower power, all else equal.
-# * 'delta_AI' is the effect size: try multiple values (e.g., 0.03, 0.05, 0.10) to see how N requirements change.
-# * This code assumes required packages (lme4, lmerTest, dplyr, ggplot2, tibble, glue) are already attached.
-# ----------------------------------------------------------------------------------------------
+print(add_power_references(q1_plot))
+report_minimum_N(q1_results, "Q1")
 ```
 
-### Question 3: Between-Coder Group Speed
+# Question 2: Between-group Jaccard agreement
 
-Does coding speed vary significantly between coder groups (student, clinician, coder)?
+Does marginal Jaccard agreement vary between coder groups? This analysis estimates power separately for the three pairwise group contrasts averaged over AI condition. The p-values are Tukey-adjusted within each simulated dataset.
 
-\begin{align}
-log(time)_{r,i} &= \alpha_0 + \alpha_{AI} * Cond_{r} + \alpha_{Group} * Group_{i} + \gamma * TrainIndex_{r,i} + \beta_{i}^{coder} + \beta_{r}^{record} + \epsilon_{r,i} \\
-\beta_i^{coder} &\sim N(0, \tau_{coder}^2) \\
-\beta_r^{record} &\sim N(0, \tau_{record}^2) \\
-\epsilon_{r,i} &\sim N(0, \sigma^2)
-\end{align}
+For this question, the AI lift remains zero so that the generating signal is the prespecified difference among manual-condition group means.
 
-```{r}
-# Q3 POWER: Group effect on log-time per record
-# Model: log(time) ~ Group + Condition + TrialIndex + (1|Coder) + (1|Record)
-# Test: Group main effect. Alpha = 0.05. Power vs N.
-# -----------------------------------------------------------------------------
-# PURPOSE (plain English):
-#   Estimate statistical power to detect differences in coding time across
-#   coder groups (Student, Clinician, Coder), when modeling log-transformed time
-#   with mixed effects for coder and record. Each "power" point is the fraction
-#   of simulated datasets (at a given N) where the p-value for the GROUP term
-#   is below alpha (0.05).
-# -----------------------------------------------------------------------------
+```{r q2-power}
+q2_results <- purrr::map_dfr(N_grid, function(N) {
+  sim_results <- purrr::map_dfr(seq_len(reps), function(i) {
+    run_jaccard_once(
+      N = N,
+      delta_AI = 0.00,
+      target = "group"
+    )
+  })
 
-# Set random seed
-set.seed(42)  # Reproducibility: ensures the same random draws during simulation
+  sim_results |>
+    group_by(contrast) |>
+    summarise(
+      N = N,
+      successful_fits = sum(!is.na(p_value)),
+      power = mean(p_value < alpha, na.rm = TRUE),
+      .groups = "drop"
+    )
+})
 
-# ---- ASSUMPTIONS TO SET ----
-alpha <- 0.05  # Significance threshold for testing the group main effect
-N_grid <- seq(N_min, N_max, by = steps)  # Range of record counts N to evaluate
+if (all(q2_results$successful_fits == 0)) {
+  stop(
+    "All Q2 model fits or contrast extractions failed. ",
+    "Inspect run_jaccard_once() without tryCatch for one replicate."
+  )
+}
 
-coders_per_group <- 2                          # Study design: 2 coders in each group
-groups <- c("Student","Clinician","Coder")     # The three coder groups
-M <- length(groups) * coders_per_group         # Total coders (not directly used below)
+q2_plot <- ggplot(
+  q2_results,
+  aes(x = N, y = power, color = contrast)
+) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Q2 Power: Pairwise Group Differences in Jaccard Agreement",
+    subtitle = "Tukey-adjusted marginal contrasts averaged over AI condition",
+    x = "Number of records (N)",
+    y = expression(Power ~ (alpha == 0.05)),
+    color = "Contrast"
+  )
 
-# Baseline geometric mean time (Manual) for Coders (seconds); adjust per domain.
-gm_manual_coder <- 120   # 2 minutes per record; inpatient times can be longer)
-# NOTE: We model times on the *log* scale, so multiplicative effects (e.g., 25% slower)
-#       become additive shifts in log-time.
+print(add_power_references(q2_plot))
+report_minimum_N(q2_results, "Q2")
+```
 
-# Group multiplicative effects on time (relative to Coders)
-ratio_student   <- 1.25  # students are 25% slower
-ratio_clinician <- 1.10  # clinicians are 10% slower
-# INTERPRETATION: A ratio > 1 means slower than Coders; e.g., 1.25 = 25% longer times.
-# On the log scale this is log(1.25) added to Student rows, etc.
+# Coding-time simulation
 
-# AI time ratio (overall) -- set to 1.0 here because Q3 focuses on group effect
-ai_ratio <- 1.00  # No AI speed-up/slow-down is simulated in this Q3 power analysis
+## Model and assumptions
 
-# Learning curve slope on log-scale per additional record (negative => faster over time)
-learn_slope <- -0.002  # small per-record improvement
-# INTERPRETATION: per additional record attempted (centered within coder),
-#                 log-time decreases slightly (i.e., practice effect).
+For record $r$ and coder $i$, coding time is generated on the log scale:
 
-# Random-effect SDs on log-time
-sd_coder  <- 0.20  # SD of coder-specific random intercepts (heterogeneity among coders)
-sd_record <- 0.50  # SD of record-specific random intercepts (difficulty variability across records)
-sd_resid  <- 0.20  # Residual SD at observation level (within coder×record noise)
-# INTERPRETATION (multiplicative on original time scale): exp(SD) is the typical multiplicative spread.
-#   e.g., exp(0.35) = 1.42 implies +/-42% fluctuation around expected time for the same coder & record.
+\[
+\log(T_{ri}) = \alpha_0 + \alpha_{AI}AI_r +
+\alpha_{Group}Group_i + \gamma Order_{ri} +
+\beta_L L_r + b_i + u_r + \epsilon_{ri}.
+\]
 
-simulate_once <- function(N) {
-  # Assign records to conditions at 50/50
-  cond_vec <- sample(rep(c("AI", "Manual"), each = N / 2), size = N, replace = FALSE)
-  # ^ Each record is assigned to a single condition (AI or Manual), shared by all coders.
-  #   Balanced assignment improves numerical stability (both levels present).
+The coder roster contains eight coders with the study allocation of three clinicians, two coders, and three students. Each coder receives an independent random ordering of the $N$ records. `order_global` is therefore the uncentered integer sequence from 1 through $N$ within each coder, matching the construction in the study analysis.
 
-  # Build coder roster
-  df <- expand.grid(record = seq_len(N),
-                    group  = groups,
-                    coder  = seq_len(coders_per_group),
-                    KEEP.OUT.ATTRS = FALSE) |>
-    dplyr::mutate(coder_id = paste(group, coder, sep = "_"),  # Unique coder identifier (e.g., "Student_1")
-                  condition = cond_vec[record]) |>            # Join record-level condition to each row
-    arrange(coder_id, record) |>                              # Order rows: within coder over records
+The fitted model is:
+
+```r
+log(time_sec) ~ condition * group + order_global + text_length +
+  (1 | coder_id) + (1 | record)
+```
+
+The pre-hoc assumptions are retained. Because the original power script did not specify a text-length effect, `beta_text_time` is set to zero during generation while text length remains in the fitted model. No 600-second exclusion is applied.
+
+```{r time-assumptions}
+# Pre-hoc fixed-effect assumptions.
+gm_manual_coder <- 120
+ratio_student <- 1.25
+ratio_clinician <- 1.10
+learn_slope <- -0.002
+beta_text_time <- 0
+
+# Pre-hoc random-effect assumptions.
+sd_coder_time <- 0.20
+sd_record_time <- 0.50
+
+# The original script used different residual assumptions for the group and AI questions.
+sd_resid_time_group <- 0.20
+sd_resid_time_ai <- 0.35
+```
+
+## One coding-time data-generating function
+
+```{r time-functions}
+simulate_time_data <- function(N, ai_ratio, sd_resid) {
+  record_data <- tibble(
+    record = factor(seq_len(N)),
+    condition = assign_condition(N),
+    text_length = simulate_text_length(N),
+    b_record = rnorm(N, mean = 0, sd = sd_record_time)
+  )
+
+  coder_data <- coder_roster |>
+    mutate(
+      b_coder = rnorm(n(), mean = 0, sd = sd_coder_time)
+    )
+
+  # Create an independent randomized task order for each coder.
+  order_data <- tidyr::crossing(
+    coder_id = coder_data$coder_id,
+    record = factor(seq_len(N), levels = levels(record_data$record))
+  ) |>
     group_by(coder_id) |>
-    mutate(trial_idx = row_number(),                          # 1..N attempt index per coder
-           trial_idx_c = scale(trial_idx, center = TRUE,      # Center trial index within coder (no scaling)
-                               scale = FALSE)[,1]) |>
-    ungroup()
-
-  # Random intercepts
-  b_coder  <- rnorm(length(unique(df$coder_id)), 0, sd_coder); names(b_coder) <- unique(df$coder_id)
-  b_record <- rnorm(N, 0, sd_record)
-  # ^ b_coder: coder-specific baseline speed differences (on log-time).
-  #   b_record: record-specific difficulty differences (shared by all coders for that record).
-
-  # Fixed effects construction
-  log_gm_coder_manual <- log(gm_manual_coder)  # Baseline (Coders, Manual) on log scale
-  group_ratio <- c(Student = ratio_student, Clinician = ratio_clinician, Coder = 1.0)  # Group multipliers
-  cond_ratio  <- c(AI = ai_ratio, Manual = 1.0)                                       # Condition multipliers
-
-  df <- df |>
     mutate(
-      # 'base' is the expected log-time given fixed effects + random intercepts:
-      base = log_gm_coder_manual 
-             + log(group_ratio[group])            # group effect (multiplicative on time -> additive on log-time)
-             + log(cond_ratio[condition])         # condition effect (here 0 because ai_ratio = 1.00)
-             + learn_slope * trial_idx_c          # small learning (practice) effect per coder
-             + b_coder[coder_id] + b_record[record],  # random intercepts for coder and record d
-      log_time = base + rnorm(n(), 0, sd_resid),  # add residual noise at the observation level
-      time_sec = exp(log_time)                    # convert back to seconds (for exclusion rule only)
+      simulated_order = sample.int(N, size = N, replace = FALSE)
     ) |>
-    # Apply your exclusion (>10 minutes)
-    filter(time_sec <= 600)
-  # ^ Mirrors the planned QC step: extremely long times are excluded prior to modeling.
+    arrange(simulated_order, .by_group = TRUE) |>
+    mutate(order_global = row_number()) |>
+    ungroup() |>
+    select(coder_id, record, order_global)
 
-  fit <- suppressMessages(suppressWarnings(lmer(log_time ~ group + condition + trial_idx_c + (1|coder_id) + (1|record),
-                               data = df, REML = TRUE)))
-  # ^ Mixed-effects model on log-time:
-  #   - Fixed effects: group (target of test), condition (balanced but set to no effect here), trial index (learning)
-  #   - Random intercepts: coder_id (accounts for coder heterogeneity), record (accounts for record difficulty)
-  #   - REML: common for variance component estimation in LMMs
+  group_ratio <- c(
+    Student = ratio_student,
+    Clinician = ratio_clinician,
+    Coder = 1.00
+  )
 
-  an <- anova(fit, type = 3)  # Type III ANOVA table to test main effects after accounting for others
-  p_group <- an["group","Pr(>F)"]  # Extract p-value for the group main effect (our target)
-  return(p_group)  # Return the p-value for this simulated dataset
+  condition_ratio <- c(
+    Manual = 1.00,
+    AI = ai_ratio
+  )
+
+  tidyr::crossing(
+    coder_id = coder_data$coder_id,
+    record = factor(seq_len(N), levels = levels(record_data$record))
+  ) |>
+    left_join(coder_data, by = "coder_id") |>
+    left_join(record_data, by = "record") |>
+    left_join(order_data, by = c("coder_id", "record")) |>
+    mutate(
+      expected_log_time =
+        log(gm_manual_coder) +
+          log(unname(group_ratio[as.character(group)])) +
+          log(unname(condition_ratio[as.character(condition)])) +
+          learn_slope * order_global +
+          beta_text_time * text_length +
+          b_coder +
+          b_record,
+      log_time = expected_log_time +
+        rnorm(n(), mean = 0, sd = sd_resid),
+      time_sec = exp(log_time)
+    ) |>
+    select(
+      record,
+      coder_id,
+      group,
+      condition,
+      order_global,
+      text_length,
+      time_sec,
+      log_time
+    )
 }
 
-# For each N, simulate 'reps' datasets, fit the model, collect p-values for the group effect,
-# and compute power as the fraction of p-values below alpha.
-res <- lapply(N_grid, function(N) {
-  pvals <- replicate(reps, simulate_once(N))             # Vector of p-values across replicates
-  tibble(N = N, power = mean(pvals < alpha, na.rm = TRUE))  # Estimated power at this N
-}) |> bind_rows()
-
-# Plot the power curve (power vs. N) with a dashed 80% reference line
-p <- ggplot(res, aes(N, power)) +
-  geom_line(color = "#2c7fb8", linewidth = 1) +
-  geom_hline(yintercept = 0.80, linetype = "dashed", color = "red") +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-  labs(title = "Q3 Power: Detecting Group Differences in Coding Time",
-       x = "Number of records (N)",
-       y = expression(Power ~ (alpha == 0.05))) +
-  theme_minimal(base_size = 12)
-print(p)  # Display the power curve
-
-# Identify the smallest N achieving at least 80% power on this grid,
-# and print a human-readable message with the result.
-minN <- res |> filter(power >= 0.80) |> slice_head(n=1)
-if (nrow(minN)==0) {
-  message("No N in grid reached 80% power. Increase N or group differences.")
-  # If 80% isn't reached, options:
-  #   - Increase N (more records per coder),
-  #   - Assume larger between-group differences (increase ratios),
-  #   - Reduce variance assumptions (if justified by data),
-  #   - Increase 'reps' for more precise estimates (Monte Carlo error).
-} else {
-  print(glue::glue("Smallest N with greater than 80% power (Q3): N = {minN$N}, estimated power = {scales::percent(minN$power, accuracy=0.1)}"))
+fit_time_model <- function(data) {
+  lmerTest::lmer(
+    log(time_sec) ~ condition * group + order_global + text_length +
+      (1 | coder_id) + (1 | record),
+    data = data,
+    REML = TRUE
+  )
 }
-# -----------------------------------------------------------------------------
-# INTERPRETATION TIPS (for stakeholders):
-#   * Because we work on log-time, coefficients translate to PERCENT differences:
-#       If beta = log(1.25) = 0.223, that means ~25% longer times.
-#   * Random-effects SDs (sd_coder, sd_record, sd_resid) quantify variability at:
-#       - Coder level (differences in baseline speed),
-#       - Record level (differences in inherent difficulty),
-#       - Observation level (trial-to-trial noise for a coder on a record).
-#   * Larger variances => lower power, all else equal.
-#   * The exclusion at 600s should mirror your real QC; sensitivity analyses can test other thresholds.
-# -----------------------------------------------------------------------------
+
+# Q3 target: one AI-versus-manual comparison averaged over coder groups.
+extract_time_ai_pvalue <- function(fit) {
+  emm_condition <- emmeans::emmeans(
+    fit,
+    ~condition,
+    type = "response"
+  )
+
+  emmeans::contrast(
+    emm_condition,
+    method = "pairwise",
+    adjust = "none"
+  ) |>
+    summary() |>
+    as.data.frame() |>
+    pull(p.value) |>
+    first()
+}
+
+# Q4 target: three coder-group comparisons averaged over condition.
+# Tukey adjustment is applied to the family of three comparisons.
+extract_time_group_pvalues <- function(fit) {
+  emm_group <- emmeans::emmeans(fit, ~group, type = "response")
+
+  emmeans::contrast(
+    emm_group,
+    method = "pairwise",
+    adjust = "tukey"
+  ) |>
+    summary() |>
+    as.data.frame() |>
+    transmute(
+      contrast = as.character(contrast),
+      p_value = p.value
+    )
+}
+
+# One simulation wrapper is used by both coding-time questions.
+run_time_once <- function(
+  N,
+  ai_ratio,
+  sd_resid,
+  target = c("group", "AI")
+) {
+  target <- match.arg(target)
+
+  tryCatch(
+    {
+      data <- simulate_time_data(
+        N = N,
+        ai_ratio = ai_ratio,
+        sd_resid = sd_resid
+      )
+
+      fit <- suppressMessages(suppressWarnings(fit_time_model(data)))
+
+      if (target == "group") {
+        extract_time_group_pvalues(fit)
+      } else {
+        extract_time_ai_pvalue(fit)
+      }
+    },
+    error = function(e) {
+      if (target == "group") {
+        tibble(
+          contrast = c(
+            "Clinician - Coder",
+            "Clinician - Student",
+            "Coder - Student"
+          ),
+          p_value = NA_real_
+        )
+      } else {
+        NA_real_
+      }
+    }
+  )
+}
 ```
 
-### Question 4: Between- AI Group Speed
+# Question 3: AI effect on coding time
 
-Does coding speed vary significantly between with- and without-AI coder groups?
+Does marginal coding time differ between AI-assisted and manual coding? The target is the AI-versus-manual contrast averaged equally over coder groups, matching `emmeans(fit, ~ condition, type = "response")` followed by a single unadjusted pairwise contrast.
 
-\begin{align}
-log(time)_{r,i} &= \alpha_0 + \alpha_{AI} * Cond_{r} + \alpha_{Group} * Group_{i} + \gamma * TrainIndex_{r,i} + \beta_{i}^{coder} + \beta_{r}^{record} + \epsilon_{r,i} \\
-\beta_i^{coder} &\sim N(0, \tau_{coder}^2) \\
-\beta_r^{record} &\sim N(0, \tau_{record}^2) \\
-\epsilon_{r,i} &\sim N(0, \sigma^2)
-\end{align}
+```{r q3-power}
+q3_results <- purrr::map_dfr(N_grid, function(N) {
+  p_values <- replicate(
+    reps,
+    run_time_once(
+      N = N,
+      ai_ratio = 0.80,
+      sd_resid = sd_resid_time_ai,
+      target = "AI"
+    )
+  )
 
-```{r}
-# Q4 POWER: AI vs Manual effect on log-time per record
-# Same data generation as Q3, but ai_ratio != 1 and the test targets the condition main effect.
-# ---------------------------------------------------------------------------------------------
-# PURPOSE (plain English):
-#   Estimate statistical power to detect a difference in coding time between AI and Manual,
-#   when time is modeled on the log scale with mixed effects for coder and record.
-#   Power at a given N is the fraction of simulated datasets where the p-value for the
-#   CONDITION main effect (AI vs Manual) is below alpha (0.05).
-# ---------------------------------------------------------------------------------------------
+  tibble(
+    N = N,
+    power = mean(p_values < alpha, na.rm = TRUE)
+  )
+})
 
-# Set random seed
-set.seed(42)  # Reproducibility: ensures the same random draws each time you run this simulation
-
-# ---- ASSUMPTIONS TO SET ----
-alpha <- 0.05   # Significance threshold for hypothesis testing (Pr(>F) < 0.05 => detect AI effect)
-N_grid <- seq(N_min, N_max, by = steps)  # Range of record counts N over which we evaluate power
-
-coders_per_group <- 2                           # Study design: 2 coders per group
-M <- length(groups) * coders_per_group          # Total coders (not directly used below)
-
-gm_manual_coder <- 120      # Baseline geometric mean time (seconds) for Coders under Manual
-ratio_student   <- 1.25     # Students take 25% longer than Coders (multiplicative effect)
-ratio_clinician <- 1.10     # Clinicians take 10% longer than Coders (multiplicative effect)
-
-# AI time ratio (e.g., 0.8 = 20% faster with AI).
-ai_ratio <- 0.80
-
-learn_slope <- -0.002  # Learning curve slope on log-time per additional record (centered). Negative => faster with practice.
-sd_coder  <- 0.20      # Random intercept SD on log-time for coder (between-coder variability)
-sd_record <- 0.50      # Random intercept SD on log-time for record (between-record difficulty variability)
-sd_resid  <- 0.35      # Residual SD on log-time (within coder×record noise / trial-to-trial variability)
-# NOTE on interpretation of SDs: exp(SD) is the typical multiplicative spread on the time scale.
-#   e.g., exp(0.35) = 1.42 => within-observation noise can vary times by +/-42% around the expected value.
-
-simulate_once <- function(N) {
-  # Assign records to conditions in a balanced way (50/50 AI and Manual).
-  # Each record's condition is shared by all coders (record-level condition).
-  cond_vec <- sample(rep(c("AI", "Manual"), each = N / 2), size = N, replace = FALSE)
-
-  # Build the coder-by-record grid and add the condition per record to each row
-  df <- expand.grid(record = seq_len(N),
-                    group  = groups,
-                    coder  = seq_len(coders_per_group),
-                    KEEP.OUT.ATTRS = FALSE) |>
-    dplyr::mutate(coder_id = paste(group, coder, sep = "_"),  # Unique coder identifier (e.g., "Student_1")
-                  condition = cond_vec[record]) |>            # Join record-level condition to each row
-    arrange(coder_id, record) |>
-    group_by(coder_id) |>
-    mutate(trial_idx = row_number(),                           # Attempt number per coder (1..N)
-           trial_idx_c = scale(trial_idx, center = TRUE,       # Center within coder to decouple from intercept
-                                scale = FALSE)[,1]) |>
-    ungroup()
-
-  # Random intercepts for coder and record (log-time scale)
-  b_coder  <- rnorm(length(unique(df$coder_id)), 0, sd_coder); names(b_coder) <- unique(df$coder_id)
-  b_record <- rnorm(N, 0, sd_record)
-
-  # Build fixed-effect components on the log-time scale:
-  # - Baseline (Coders, Manual) is log(gm_manual_coder)
-  # - Group multipliers: Students and Clinicians are slower than Coders (ratios > 1)
-  # - Condition multiplier: AI has ai_ratio (<1 for faster)
-  log_gm_coder_manual <- log(gm_manual_coder)
-  group_ratio <- c(Student = ratio_student, Clinician = ratio_clinician, Coder = 1.0)
-  cond_ratio  <- c(AI = ai_ratio,           Manual = 1.0)
-
-  df <- df |>
-    mutate(
-      # Expected log-time given fixed effects and random intercepts:
-      base = log_gm_coder_manual 
-             + log(group_ratio[group])       # Group effect (multiplicative on time -> additive on log-time)
-             + log(cond_ratio[condition])    # Condition effect (AI vs Manual; ai_ratio < 1 => faster)
-             + learn_slope * trial_idx_c     # Learning effect: small speed-up with experience
-             + b_coder[coder_id] + b_record[record],  # Random intercepts: coder- and record-level
-      log_time = base + rnorm(n(), 0, sd_resid),  # Add observation-level noise (residual)
-      time_sec = exp(log_time)                    # Back-transform for QC filtering only
-    ) |>
-    filter(time_sec <= 600)  # Apply exclusion: drop times > 10 minutes, mirroring planned QC
-
-  # Fit the linear mixed model on log-time:
-  #   Fixed: condition (target), group (nuisance), trial_idx_c (learning)
-  #   Random: (1|coder_id) to account for coder heterogeneity,
-  #           (1|record)   to account for record difficulty variation.
-  fit <- suppressMessages(suppressWarnings(lmer(log_time ~ condition + group + trial_idx_c + (1|coder_id) + (1|record),
-                               data = df, REML = TRUE)))
-
-  # Extract p-value for the condition main effect (AI vs Manual) from a Type III ANOVA table
-  an <- anova(fit, type = 3)
-  p_cond <- an["condition","Pr(>F)"]
-  return(p_cond)  # Return the p-value for this simulated dataset
-}
-
-# For each N in N_grid, run 'reps' simulations; compute power as the share of p-values < alpha
-res <- lapply(N_grid, function(N) {
-  pvals <- replicate(reps, simulate_once(N))                 # Vector of p-values across replicates
-  tibble(N = N, power = mean(pvals < alpha, na.rm = TRUE))   # Estimated power at this N
-}) |> bind_rows()
-
-# Plot the power curve (power vs. N) with a dashed horizontal line at 80%
-p <- ggplot(res, aes(N, power)) +
+q3_plot <- ggplot(q3_results, aes(x = N, y = power)) +
   geom_line(color = "#2c7fb8", linewidth = 1) +
-  geom_hline(yintercept = 0.80, linetype = "dashed", color = "red") +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-  labs(title = "Q4 Power: Detecting AI vs Manual Difference in Coding Time",
-       x = "Number of records (N)",
-       y = expression(Power ~ (alpha == 0.05))) +
-  theme_minimal(base_size = 12)
-print(p)  # Display the power curve
-# Identify the smallest N on this grid achieving at least 80% power; print a readable message
-minN <- res |> filter(power >= 0.80) |> slice_head(n=1)
-if (nrow(minN)==0) {
-  message("No N in grid reached 80% power. Increase N or AI effect size.")
-  # If 80% isn't reached:
-  #   - Increase N (more records),
-  #   - Assume a stronger AI effect (smaller ai_ratio, e.g., 0.75 = 25% faster),
-  #   - Reduce variance assumptions (sd_*), if justified,
-  #   - Increase 'reps' for more precise power estimates (less Monte Carlo error).
-} else {
-  print(glue::glue("Smallest N with greater than 80% power (Q4): N = {minN$N}, estimated power = {scales::percent(minN$power, accuracy=0.1)}"))
+  labs(
+    title = "Q3 Power: AI vs Manual Difference in Coding Time",
+    subtitle = "Marginal AI contrast averaged over coder groups",
+    x = "Number of records (N)",
+    y = expression(Power ~ (alpha == 0.05))
+  )
+
+print(add_power_references(q3_plot))
+report_minimum_N(q3_results, "Q3")
+```
+
+# Question 4: Between-group coding time
+
+Does marginal coding time vary among coder groups? This analysis estimates power separately for the three pairwise group contrasts averaged over AI condition. The p-values are Tukey-adjusted within each simulated dataset. For this question, `ai_ratio = 1.00`, so no AI effect is generated.
+
+```{r q4-power}
+q4_results <- purrr::map_dfr(N_grid, function(N) {
+  sim_results <- purrr::map_dfr(seq_len(reps), function(i) {
+    run_time_once(
+      N = N,
+      ai_ratio = 1.00,
+      sd_resid = sd_resid_time_group,
+      target = "group"
+    )
+  })
+
+  sim_results |>
+    group_by(contrast) |>
+    summarise(
+      N = N,
+      successful_fits = sum(!is.na(p_value)),
+      power = mean(p_value < alpha, na.rm = TRUE),
+      .groups = "drop"
+    )
+})
+
+if (all(q4_results$successful_fits == 0)) {
+  stop(
+    "All Q4 model fits or contrast extractions failed. ",
+    "Inspect run_time_once() without tryCatch for one replicate."
+  )
 }
 
-# ---------------------------------------------------------------------------------------------
-# STAKEHOLDER NOTES:
-# * Because we model log-time, coefficients translate to percent changes:
-#     e.g., ai_ratio = 0.80 implies beta_AI = log(0.80) = -0.223, i.e., ~20% faster with AI.
-# * Random effects improve realism:
-#     - (1|coder_id): some coders are generally faster/slower.
-#     - (1|record): some records are inherently faster/harder to code.
-# * The exclusion at 600s reflects your planned QC; consider sensitivity checks (e.g., 900s).
-# * Power improves with larger N, stronger AI effects (smaller ai_ratio), or lower variability (sd_coder/sd_record/sd_resid).
-# ---------------------------------------------------------------------------------------------
+q4_plot <- ggplot(
+  q4_results,
+  aes(x = N, y = power, color = contrast)
+) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Q4 Power: Pairwise Group Differences in Coding Time",
+    subtitle = "Tukey-adjusted marginal contrasts averaged over AI condition",
+    x = "Number of records (N)",
+    y = expression(Power ~ (alpha == 0.05)),
+    color = "Contrast"
+  )
+
+print(add_power_references(q4_plot))
+report_minimum_N(q4_results, "Q4")
 ```
