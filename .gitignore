@@ -231,6 +231,8 @@ records_df*
 
 # R
 *.Rhistory
+*.Rproj
 
 # Model predictions
 analysis/gatortron_predictions.json
+.Rproj.user
