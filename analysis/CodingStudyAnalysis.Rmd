@@ -1134,7 +1134,7 @@ p_time_emmeans <- ggplot(
   labs(
     title = "Predicted Coding Time",
     x = "Group",
-    y = "Predicted Time [seconds]",
+    y = "Estimated Geometric Mean Time [seconds]",
     color = "AI Use"
   ) +
   theme_classic(base_size = 18) +
