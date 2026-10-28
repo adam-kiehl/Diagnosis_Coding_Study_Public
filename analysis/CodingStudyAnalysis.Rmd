@@ -344,27 +344,6 @@ records_long <- records_long %>%
 
 ### 2.1 Exploratory Tables
 
-Computes the average number of assigned codes for each coder group.
-
-```{r summarize-code-counts}
-# Count whitespace-delimited code tokens, preserving missing values separately from empty strings.
-avg_n_codes <- records_long %>%
-  mutate(
-    n_codes = case_when(
-      is.na(codes) ~ NA_real_,
-      str_trim(codes) == "" ~ 0,
-      TRUE ~ str_count(str_trim(codes), "\\S+")
-    )
-  ) %>%
-  group_by(group) %>%
-  summarise(
-    avg_n_codes = mean(n_codes, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-avg_n_codes
-```
-
 Computes the average number of assigned codes for each condition.
 
 ```{r summarize-code-counts2}
@@ -386,42 +365,86 @@ avg_n_codes <- records_long %>%
 avg_n_codes
 ```
 
+Computes the average number of assigned codes for each coder group.
+
+```{r summarize-code-counts}
+# Count whitespace-delimited code tokens, preserving missing values separately from empty strings.
+avg_n_codes <- records_long %>%
+  mutate(
+    n_codes = case_when(
+      is.na(codes) ~ NA_real_,
+      str_trim(codes) == "" ~ 0,
+      TRUE ~ str_count(str_trim(codes), "\\S+")
+    )
+  ) %>%
+  group_by(group) %>%
+  summarise(
+    avg_n_codes = mean(n_codes, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+avg_n_codes
+```
+
+Summarizes coding-time distribution by AI-use condition.
+
+```{r summarize-time-by-ai}
+time_by_condition <- records_long %>%
+  group_by(ai) %>%
+  rename(Condition = ai) %>%
+  summarise(
+    N = sum(!is.na(time)),
+    Mean = mean(time, na.rm = TRUE),
+    Median = median(time, na.rm = TRUE),
+    SD = sd(time, na.rm = TRUE),
+    IQR = IQR(time, na.rm = TRUE),
+    Min = min(time, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 1))
+
+time_by_condition
+```
+
 Summarizes coding-time means and standard deviations by coder group.
 
 ```{r summarize-time-by-group}
 # Produce an unadjusted descriptive summary of coding time by experience group.
 records_long %>%
   group_by(group) %>%
-  summarize(
-    mean(time),
-    median(time),
-    sd(time)
-  )
+  summarise(
+    N = sum(!is.na(time)),
+    Mean = mean(time, na.rm = TRUE),
+    Median = median(time, na.rm = TRUE),
+    SD = sd(time, na.rm = TRUE),
+    IQR = IQR(time, na.rm = TRUE),
+    Min = min(time, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 1))
 ```
 
-Summarizes coding-time means and standard deviations by AI-use condition.
+Summarizes coding-time distribution by AI-use condition and coder group.
 
-```{r summarize-time-by-ai}
-# Produce an unadjusted descriptive summary of coding time by AI-use condition.
-records_long %>%
-  group_by(ai) %>%
-  summarize(
-    mean(time),
-    median(time),
-    sd(time)
-  )
-```
+```{r}
+time_by_condition_group <- records_long %>%
+  group_by(ai, group) %>%
+  rename(
+    Condition = ai,
+    Group = group
+  ) %>%
+  summarise(
+    N = sum(!is.na(time)),
+    Mean = mean(time, na.rm = TRUE),
+    Median = median(time, na.rm = TRUE),
+    SD = sd(time, na.rm = TRUE),
+    IQR = IQR(time, na.rm = TRUE),
+    Min = min(time, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 1))
 
-Summarizes Jaccard means and standard deviations by coder group.
-
-```{r summarize-jaccard-by-group}
-# Produce an unadjusted descriptive summary of agreement by experience group.
-jaccard_by_record_group %>%
-  group_by(group) %>%
-  summarize(
-    mean(jaccard_avg),
-    sd(jaccard_avg)
-  )
+time_by_condition_group
 ```
 
 Summarizes Jaccard means and standard deviations by AI-use condition.
@@ -430,205 +453,136 @@ Summarizes Jaccard means and standard deviations by AI-use condition.
 # Produce an unadjusted descriptive summary of agreement by AI-use condition.
 jaccard_by_record_group %>%
   group_by(ai) %>%
+  rename(Condition = ai) %>%
   summarize(
-    mean(jaccard_avg),
-    sd(jaccard_avg)
-  )
+    N = sum(!is.na(jaccard_avg)),
+    Mean = mean(jaccard_avg, na.rm = TRUE),
+    Median = median(jaccard_avg, na.rm = TRUE),
+    SD = sd(jaccard_avg, na.rm = TRUE),
+    IQR = IQR(jaccard_avg, na.rm = TRUE),
+    "% Perfect Agreement" = 100 * mean(jaccard_avg == 1, na.rm = TRUE),
+    "% Perfect Disagreement" = 100 * mean(jaccard_avg == 0, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 2))
+```
+
+Summarizes Jaccard means and standard deviations by coder group.
+
+```{r summarize-jaccard-by-group}
+# Produce an unadjusted descriptive summary of agreement by experience group.
+jaccard_by_record_group %>%
+  group_by(group) %>%
+  rename(Group = group) %>%
+  summarize(
+    N = sum(!is.na(jaccard_avg)),
+    Mean = mean(jaccard_avg, na.rm = TRUE),
+    Median = median(jaccard_avg, na.rm = TRUE),
+    SD = sd(jaccard_avg, na.rm = TRUE),
+    IQR = IQR(jaccard_avg, na.rm = TRUE),
+    "% Perfect Agreement" = 100 * mean(jaccard_avg == 1, na.rm = TRUE),
+    "% Perfect Disagreement" = 100 * mean(jaccard_avg == 0, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 2))
+```
+
+Summarize Jaccard boundary values by AI-use condition.
+
+```{r}
+jaccard_by_record_group %>%
+  group_by(ai, group) %>%
+  rename(
+    Condition = ai,
+    Group = group
+  ) %>%
+  summarize(
+    N = sum(!is.na(jaccard_avg)),
+    Mean = mean(jaccard_avg, na.rm = TRUE),
+    Median = median(jaccard_avg, na.rm = TRUE),
+    SD = sd(jaccard_avg, na.rm = TRUE),
+    IQR = IQR(jaccard_avg, na.rm = TRUE),
+    "% Perfect Agreement" = 100 * mean(jaccard_avg == 1, na.rm = TRUE),
+    "% Perfect Disagreement" = 100 * mean(jaccard_avg == 0, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 2))
 ```
 
 ### 2.2 AI Suggestion Acceptance
 
-```{r ai-suggestion-acceptance}
-# -------------------------------------------------------------------------
-# 1. Import model predictions
-#
-# Expected JSON structure:
-# {
-#   "12345": ["111111", "222222"],
-#   "12346": []
-# }
-# -------------------------------------------------------------------------
-
-predictions_raw <- jsonlite::fromJSON(
-  "gatortron_predictions.json",
-  simplifyVector = FALSE
-)
-
-predictions_df <- tibble(
-  record_id = as.integer(names(predictions_raw)),
-  predicted_codes = unname(predictions_raw)
-) %>%
+```{r}
+ai_overlap_table <- ai_comparison %>%
   mutate(
-    predicted_codes = map(
-      predicted_codes,
-      ~ sort(unique(as.character(.x)))
-    )
-  )
-
-# -------------------------------------------------------------------------
-# Robust code parser
-# -------------------------------------------------------------------------
-
-split_response_codes <- function(value) {
-  # Each call should receive one dataframe cell
-  if (length(value) == 0L || is.null(value) || all(is.na(value))) {
-    return(character(0))
-  }
-
-  # Explicitly coerce factors, integers, and other atomic values to text
-  value <- as.character(value[[1]])
-
-  if (is.na(value) || trimws(value) == "") {
-    return(character(0))
-  }
-
-  # Split on one or more whitespace characters
-  result <- unlist(
-    strsplit(trimws(value), split = "\\s+"),
-    use.names = FALSE
-  )
-
-  # Remove blanks and duplicates, then sort for reproducibility
-  sort(unique(result[nzchar(result)]))
-}
-
-
-# -------------------------------------------------------------------------
-# Filter AI responses, parse response codes, and join predictions
-# -------------------------------------------------------------------------
-
-ai_comparison <- records_long %>%
-  dplyr::filter(.data$ai %in% TRUE) %>%
-  dplyr::mutate(
-    record_id = as.integer(.data$record_id),
-    group = as.character(.data$group),
-
-    # Explicit package and column references prevent name collisions
-    response_codes = purrr::map(
-      as.character(.data$codes),
-      split_response_codes
-    )
-  ) %>%
-  dplyr::left_join(
-    predictions_df,
-    by = "record_id"
-  )
-
-# Stop if any AI-assisted responses do not have corresponding JSON predictions.
-missing_prediction_ids <- ai_comparison %>%
-  filter(map_lgl(predicted_codes, is.null)) %>%
-  distinct(record_id) %>%
-  pull(record_id)
-
-if (length(missing_prediction_ids) > 0L) {
-  stop(
-    "No model predictions were found for these record_id values: ",
-    paste(missing_prediction_ids, collapse = ", ")
-  )
-}
-
-ai_comparison <- ai_comparison %>%
-  mutate(
-    # Number of unique codes submitted in each response
-    n_response_codes = map_int(response_codes, length),
-
-    # Number of submitted codes that were also AI predictions
-    accepted_codes = map2(
+    response_codes = map(response_codes, unique),
+    predicted_codes = map(predicted_codes, unique),
+    n_submitted = map_int(response_codes, length),
+    n_suggested = map_int(predicted_codes, length),
+    n_overlap = map2_int(
       response_codes,
       predicted_codes,
-      intersect
+      ~ length(intersect(.x, .y))
     ),
-    n_accepted_codes = map_int(accepted_codes, length),
-
-    # Exact set equality, independent of order
-    perfect_match = map2_lgl(
+    n_added = n_submitted - n_overlap,
+    n_omitted = n_suggested - n_overlap,
+    any_added = n_added > 0,
+    any_omitted = n_omitted > 0,
+    exact_match = map2_lgl(
       response_codes,
       predicted_codes,
-      setequal
+      ~ setequal(.x, .y)
     )
   )
 
-
-# -------------------------------------------------------------------------
-# 5A. Overall metrics
-#
-# code_acceptance_pct denominator:
-#   All unique codes submitted across AI-assisted responses
-#
-# perfect_match_pct denominator:
-#   All AI-assisted responses
-# -------------------------------------------------------------------------
-
-overall_metrics <- ai_comparison %>%
-  summarise(
-    n_responses = n(),
-    total_submitted_codes = sum(n_response_codes),
-    total_accepted_ai_codes = sum(n_accepted_codes),
-    code_acceptance_pct = if_else(
-      total_submitted_codes > 0,
-      100 * total_accepted_ai_codes / total_submitted_codes,
-      NA_real_
-    ),
-    n_perfect_matches = sum(perfect_match),
-    perfect_match_pct = if_else(
-      n_responses > 0,
-      100 * n_perfect_matches / n_responses,
-      NA_real_
-    )
-  )
-
-
-# -------------------------------------------------------------------------
-# 5B. Metrics by subject group
-# -------------------------------------------------------------------------
-
-group_metrics <- ai_comparison %>%
-  group_by(group) %>%
-  summarise(
-    n_responses = n(),
-    total_submitted_codes = sum(n_response_codes),
-    total_accepted_ai_codes = sum(n_accepted_codes),
-    code_acceptance_pct = if_else(
-      total_submitted_codes > 0,
-      100 * total_accepted_ai_codes / total_submitted_codes,
-      NA_real_
-    ),
-    n_perfect_matches = sum(perfect_match),
-    perfect_match_pct = if_else(
-      n_responses > 0,
-      100 * n_perfect_matches / n_responses,
-      NA_real_
-    ),
-    .groups = "drop"
-  )
-
-
-# -------------------------------------------------------------------------
-# Optional: one presentation-ready results table
-# -------------------------------------------------------------------------
-
-results_table <- bind_rows(
-  overall_metrics %>%
-    mutate(group = "Overall", .before = 1),
-  group_metrics
-) %>%
-  mutate(
-    code_acceptance_pct = round(code_acceptance_pct, 1),
-    perfect_match_pct = round(perfect_match_pct, 1)
+summarise_overlap <- function(data) {
+  tibble(
+    `Submitted-code overlap` =
+      sum(data$n_overlap) / sum(data$n_submitted),
+    `Suggestion acceptance` =
+      sum(data$n_overlap) / sum(data$n_suggested),
+    `Added-code rate` =
+      sum(data$n_added) / sum(data$n_submitted),
+    `Responses with >=1 added code` =
+      mean(data$any_added),
+    `Responses with >=1 omitted suggestion` =
+      mean(data$any_omitted),
+    `Exact-set match` =
+      mean(data$exact_match)
   ) %>%
-  select(
-    group,
-    n_responses,
-    total_submitted_codes,
-    total_accepted_ai_codes,
-    code_acceptance_pct,
-    n_perfect_matches,
-    perfect_match_pct
+    pivot_longer(
+      everything(),
+      names_to = "measure",
+      values_to = "proportion"
+    )
+}
+
+overall_overlap <- summarise_overlap(ai_overlap_table) %>%
+  mutate(group = "Overall")
+
+group_overlap <- ai_overlap_table %>%
+  group_split(group) %>%
+  map_dfr(
+    ~ summarise_overlap(.x) %>%
+      mutate(group = as.character(first(.x$group)))
   )
 
-print(results_table)
+overlap_summary <- bind_rows(
+  overall_overlap,
+  group_overlap
+) %>%
+  mutate(percentage = 100 * proportion) %>%
+  select(measure, group, percentage) %>%
+  pivot_wider(
+    names_from = group,
+    values_from = percentage
+  ) %>%
+  rename(
+    Measure = measure,
+    Clinicians = clinicians,
+    Coders = coders,
+    Students = students
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 1))
+
+overlap_summary
 ```
-
 
 ### 2.3 Exploratory Plots
 
