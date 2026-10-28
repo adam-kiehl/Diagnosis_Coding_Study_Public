@@ -27,6 +27,25 @@ library(DHARMa)
 library(performance)
 library(emmeans)
 library(patchwork)
+
+# Colorado State University brand colors used for AI-condition plots
+csu_ai_colors <- c(
+  "FALSE" = "#1E4D2B", # Colorado State Green: manual coding
+  "TRUE"  = "#D9782D" # Aggie Orange: AI-assisted coding
+)
+# Three-level CSU palette
+csu_palette_3 <- c(
+  "#1E4D2B", # Colorado State Green
+  "#D9782D", # Aggie Orange
+  "#C8C372" # Colorado State Gold
+)
+# Four-level CSU Energy palette
+csu_palette_4 <- c(
+  "#82C503", # Lovers Lane
+  "#E56A54", # Flower Trial Red
+  "#7E5475", # Powered Purple
+  "#008FB3" # Horsetooth Blue
+)
 ```
 
 ## 1. Data Engineering
@@ -88,8 +107,8 @@ all_codes <- all_codes_df %>%
   dplyr::pull(1) %>%
   stringr::str_trim() %>%
   .[. != "" & !is.na(.)] %>%
-  suppressWarnings(as.numeric()) %>%  # convert valid code strings to numeric values
-  .[!is.na(.)] %>%                      # remove entries that could not be parsed as codes
+  suppressWarnings(as.numeric()) %>% # convert valid code strings to numeric values
+  .[!is.na(.)] %>% # remove entries that could not be parsed as codes
   unique()
 
 # Optional: keep reference codes in a stable order
@@ -107,7 +126,7 @@ Reshapes coder-specific columns into one row per record and coder, then assigns 
 subjects <- c("nadia", "katie", "terri", "beth", "naija", "erik", "caitlin", "tracy")
 
 records_long <- records_df %>%
-  rename_with( ~ paste0("codes_", .x), .cols = any_of(subjects)) %>%
+  rename_with(~ paste0("codes_", .x), .cols = any_of(subjects)) %>%
   pivot_longer(
     cols = matches("^(codes|time|order)_"),
     names_to = c(".value", "coder"),
@@ -160,20 +179,22 @@ avg_pairwise_jaccard <- function(onehot_list) {
   onehot_list <- onehot_list[!vapply(onehot_list, is.null, logical(1))]
 
   n <- length(onehot_list)
-  if (n < 2)
+  if (n < 2) {
     return(NA_real_)
+  }
 
   pairs <- combn(n, 2)
 
   scores <- purrr::map_dbl(seq_len(ncol(pairs)), function(k) {
     v1 <- onehot_list[[pairs[1, k]]]
     v2 <- onehot_list[[pairs[2, k]]]
-    s  <- jaccard_pairwise(v1, v2)
+    s <- jaccard_pairwise(v1, v2)
 
     # If both vectors are all-zeros, some implementations return NaN (0/0).
     # Common convention for Jaccard(empty, empty) is 1. Adjust if you prefer 0.
-    if (is.nan(s))
+    if (is.nan(s)) {
       s <- 1
+    }
     s
   })
 
@@ -188,8 +209,9 @@ Defines a parser that converts newline-separated code strings into unique numeri
 # Convert newline-separated code text into a numeric vector
 codes_text_to_numeric <- function(x, unique_codes = TRUE) {
   # Treat NA as empty
-  if (is.na(x))
+  if (is.na(x)) {
     return(numeric(0))
+  }
 
   # Coerce to character in case a factor slips in
   x <- as.character(x)
@@ -197,8 +219,9 @@ codes_text_to_numeric <- function(x, unique_codes = TRUE) {
   # Trim overall string; if empty after trim, return empty vector
   x_trim <- stringr::str_trim(x)
   if (identical(x_trim, "") ||
-      nchar(x_trim) == 0)
+    nchar(x_trim) == 0) {
     return(numeric(0))
+  }
 
   # Split on any line break (\n, \r\n, \r)
   parts <- stringr::str_split(x_trim, pattern = "\\r?\\n|\\r")[[1]]
@@ -207,8 +230,9 @@ codes_text_to_numeric <- function(x, unique_codes = TRUE) {
   parts <- stringr::str_trim(parts)
   parts <- parts[parts != ""]
 
-  if (length(parts) == 0)
+  if (length(parts) == 0) {
     return(numeric(0))
+  }
 
   # Convert to numeric
   nums <- suppressWarnings(as.numeric(parts))
@@ -216,8 +240,9 @@ codes_text_to_numeric <- function(x, unique_codes = TRUE) {
   # Drop any non-numeric entries (if present)
   nums <- nums[!is.na(nums)]
 
-  if (unique_codes)
+  if (unique_codes) {
     nums <- unique(nums)
+  }
 
   nums
 }
@@ -231,7 +256,7 @@ Defines a helper that maps each code vector to a binary vector aligned with the 
 one_hot_encode_codes <- function(codes_vec, ref_codes = all_codes) {
   # Handle NULL / NA / empty
   if (is.null(codes_vec) ||
-      length(codes_vec) == 0 || all(is.na(codes_vec))) {
+    length(codes_vec) == 0 || all(is.na(codes_vec))) {
     out <- integer(length(ref_codes))
     names(out) <- as.character(ref_codes)
     return(out)
@@ -247,8 +272,9 @@ one_hot_encode_codes <- function(codes_vec, ref_codes = all_codes) {
   # Efficient set membership via match (faster than %in% for large vectors)
   idx <- match(codes_vec, ref_codes, nomatch = 0L)
   idx <- idx[idx > 0L]
-  if (length(idx) > 0L)
+  if (length(idx) > 0L) {
     out[idx] <- 1L
+  }
 
   out
 }
@@ -285,8 +311,10 @@ jaccard_by_record_group <- records_long %>%
     by = c("record_id", "group")
   ) %>%
   left_join(ai_by_record, by = "record_id", suffix = c("", ".ref")) %>%
-  mutate(ai = coalesce(ai, ai.ref),
-         group = factor(group, levels = group_levels)) %>%
+  mutate(
+    ai = coalesce(ai, ai.ref),
+    group = factor(group, levels = group_levels)
+  ) %>%
   select(record_id, ai, group, jaccard_avg) %>%
   arrange(record_id, group)
 ```
@@ -364,9 +392,11 @@ Summarizes coding-time means and standard deviations by coder group.
 # Produce an unadjusted descriptive summary of coding time by experience group.
 records_long %>%
   group_by(group) %>%
-  summarize(mean(time),
-            median(time),
-            sd(time))
+  summarize(
+    mean(time),
+    median(time),
+    sd(time)
+  )
 ```
 
 Summarizes coding-time means and standard deviations by AI-use condition.
@@ -375,9 +405,11 @@ Summarizes coding-time means and standard deviations by AI-use condition.
 # Produce an unadjusted descriptive summary of coding time by AI-use condition.
 records_long %>%
   group_by(ai) %>%
-  summarize(mean(time),
-            median(time),
-            sd(time))
+  summarize(
+    mean(time),
+    median(time),
+    sd(time)
+  )
 ```
 
 Summarizes Jaccard means and standard deviations by coder group.
@@ -386,8 +418,10 @@ Summarizes Jaccard means and standard deviations by coder group.
 # Produce an unadjusted descriptive summary of agreement by experience group.
 jaccard_by_record_group %>%
   group_by(group) %>%
-  summarize(mean(jaccard_avg),
-            sd(jaccard_avg))
+  summarize(
+    mean(jaccard_avg),
+    sd(jaccard_avg)
+  )
 ```
 
 Summarizes Jaccard means and standard deviations by AI-use condition.
@@ -396,8 +430,10 @@ Summarizes Jaccard means and standard deviations by AI-use condition.
 # Produce an unadjusted descriptive summary of agreement by AI-use condition.
 jaccard_by_record_group %>%
   group_by(ai) %>%
-  summarize(mean(jaccard_avg),
-            sd(jaccard_avg))
+  summarize(
+    mean(jaccard_avg),
+    sd(jaccard_avg)
+  )
 ```
 
 ### 2.2 AI Suggestion Acceptance
@@ -434,7 +470,6 @@ predictions_df <- tibble(
 # -------------------------------------------------------------------------
 
 split_response_codes <- function(value) {
-
   # Each call should receive one dataframe cell
   if (length(value) == 0L || is.null(value) || all(is.na(value))) {
     return(character(0))
@@ -527,16 +562,13 @@ ai_comparison <- ai_comparison %>%
 overall_metrics <- ai_comparison %>%
   summarise(
     n_responses = n(),
-
     total_submitted_codes = sum(n_response_codes),
     total_accepted_ai_codes = sum(n_accepted_codes),
-
     code_acceptance_pct = if_else(
       total_submitted_codes > 0,
       100 * total_accepted_ai_codes / total_submitted_codes,
       NA_real_
     ),
-
     n_perfect_matches = sum(perfect_match),
     perfect_match_pct = if_else(
       n_responses > 0,
@@ -554,23 +586,19 @@ group_metrics <- ai_comparison %>%
   group_by(group) %>%
   summarise(
     n_responses = n(),
-
     total_submitted_codes = sum(n_response_codes),
     total_accepted_ai_codes = sum(n_accepted_codes),
-
     code_acceptance_pct = if_else(
       total_submitted_codes > 0,
       100 * total_accepted_ai_codes / total_submitted_codes,
       NA_real_
     ),
-
     n_perfect_matches = sum(perfect_match),
     perfect_match_pct = if_else(
       n_responses > 0,
       100 * n_perfect_matches / n_responses,
       NA_real_
     ),
-
     .groups = "drop"
   )
 
@@ -582,7 +610,6 @@ group_metrics <- ai_comparison %>%
 results_table <- bind_rows(
   overall_metrics %>%
     mutate(group = "Overall", .before = 1),
-
   group_metrics
 ) %>%
   mutate(
@@ -613,9 +640,9 @@ jaccard_hist_df <- jaccard_by_record_group %>%
   rename(`AI Use` = ai, Group = group) %>%
   mutate(
     `AI Use` = case_when(
-      `AI Use` == TRUE  ~ "AI-Assisted Coding",
+      `AI Use` == TRUE ~ "AI-Assisted Coding",
       `AI Use` == FALSE ~ "Manual Coding",
-      TRUE              ~ NA_character_
+      TRUE ~ NA_character_
     ),
     Group = toupper(Group),
     # Nice ordering & stable legend
@@ -625,8 +652,10 @@ jaccard_hist_df <- jaccard_by_record_group %>%
 
 jaccard_vline_df <- jaccard_hist_df %>%
   group_by(`AI Use`) %>%
-  summarise(mean_jaccard = mean(jaccard_avg, na.rm = TRUE),
-            .groups = "drop")
+  summarise(
+    mean_jaccard = mean(jaccard_avg, na.rm = TRUE),
+    .groups = "drop"
+  )
 
 p_jaccard_hist <- ggplot(jaccard_hist_df, aes(x = jaccard_avg, fill = Group)) +
   geom_histogram(
@@ -650,7 +679,7 @@ p_jaccard_hist <- ggplot(jaccard_hist_df, aes(x = jaccard_avg, fill = Group)) +
       x = mean_jaccard,
       y = Inf,
       label = paste0("Mean = ", round(mean_jaccard, 2)),
-      hjust = ifelse(mean_jaccard > 0.8, 1.1, -0.1)  # shift left if near 1
+      hjust = ifelse(mean_jaccard > 0.8, 1.1, -0.1) # shift left if near 1
     ),
     vjust = 1.3,
     inherit.aes = FALSE,
@@ -660,10 +689,11 @@ p_jaccard_hist <- ggplot(jaccard_hist_df, aes(x = jaccard_avg, fill = Group)) +
   coord_cartesian(xlim = c(0, 1), expand = FALSE) +
   scale_x_continuous(
     breaks = seq(0, 1, 0.2),
-    labels = function(x)
+    labels = function(x) {
       ifelse(x %in% c(0, 1), sprintf("%.1f", x), sprintf("%.1f", x))
+    }
   ) +
-  scale_fill_viridis_d(end = 0.9, option = "C") +
+  scale_fill_manual(values = csu_palette_3) +
   labs(
     # title = "Inter-Coder Reliability",
     # subtitle = "per record x group",
@@ -678,7 +708,7 @@ p_jaccard_hist <- ggplot(jaccard_hist_df, aes(x = jaccard_avg, fill = Group)) +
     plot.title = element_text(face = "bold", size = 22),
     plot.subtitle = element_text(size = 16, margin = margin(b = 10)),
     axis.title = element_text(size = 18),
-    axis.text  = element_text(size = 14, color = "black"),
+    axis.text = element_text(size = 14, color = "black"),
     strip.text = element_text(face = "bold", size = 16),
     strip.background = element_rect(fill = "grey95", color = NA),
     legend.position = "top",
@@ -709,15 +739,15 @@ Creates and saves a faceted coding-time trend plot by AI use and coder group.
 # Re-index task order within coder and AI condition before plotting coding-time trajectories.
 coding_speed_df <- records_long %>%
   group_by(coder, ai) %>%
-  arrange(order, .by_group = TRUE) %>%   # preserves the intended sequence
-  mutate(order = row_number()) %>%       # re-index within coder × ai
+  arrange(order, .by_group = TRUE) %>% # preserves the intended sequence
+  mutate(order = row_number()) %>% # re-index within coder × ai
   ungroup() %>%
   rename(`AI Use` = ai) %>%
   mutate(
     `AI Use` = case_when(
-      `AI Use` == TRUE  ~ "AI-Assisted Coding",
+      `AI Use` == TRUE ~ "AI-Assisted Coding",
       `AI Use` == FALSE ~ "Manual Coding",
-      TRUE              ~ NA_character_
+      TRUE ~ NA_character_
     )
   ) %>%
   rename(Group = group) %>%
@@ -726,13 +756,15 @@ coding_speed_df <- records_long %>%
 
 coding_speed_hline_df <- coding_speed_df %>%
   group_by(`AI Use`) %>%
-  summarise(mean_time = mean(time , na.rm = TRUE))
+  summarise(mean_time = mean(time, na.rm = TRUE))
 
 p2 <- ggplot(coding_speed_df, aes(x = order, y = time, color = Group)) +
   geom_point(alpha = 0.05, size = 1.2) +
-  geom_smooth(method = "lm",
-              se = FALSE,
-              linewidth = 1) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    linewidth = 1
+  ) +
   geom_hline(
     data = coding_speed_hline_df,
     aes(yintercept = mean_time),
@@ -754,13 +786,13 @@ p2 <- ggplot(coding_speed_df, aes(x = order, y = time, color = Group)) +
     inherit.aes = FALSE,
     size = 4.5
   ) +
-  facet_grid( ~ `AI Use`) +
+  facet_grid(~`AI Use`) +
   scale_y_continuous(
     trans = scales::log_trans(base = exp(1)),
     #  better than log(time) in aes
     labels = label_number(accuracy = 1)
   ) +
-  scale_color_viridis_d(end = 0.9, option = "C") +
+  scale_color_manual(values = csu_palette_3) +
   labs(
     # title = "Coding Speed Over Time",
     # subtitle = "Log-scaled time; dashed line indicates mean within facet",
@@ -773,19 +805,15 @@ p2 <- ggplot(coding_speed_df, aes(x = order, y = time, color = Group)) +
     plot.title.position = "plot",
     plot.title = element_text(face = "bold", size = 22),
     plot.subtitle = element_text(size = 16, margin = margin(b = 10)),
-
     axis.title = element_text(size = 18),
-    axis.text  = element_text(size = 14, color = "black"),
-
+    axis.text = element_text(size = 14, color = "black"),
     strip.text = element_text(face = "bold", size = 16),
     strip.background = element_rect(fill = "grey95", color = NA),
-
     legend.position = "top",
     legend.title = element_text(face = "bold"),
     legend.text = element_text(size = 14),
-
     panel.grid = element_blank(),
-    panel.spacing.x = unit(0.8, "lines")  # matches your histogram tuning
+    panel.spacing.x = unit(0.8, "lines") # matches your histogram tuning
   )
 
 p2
@@ -804,11 +832,13 @@ Creates an exploratory LOESS learning-curve plot using the coder-level global ta
 
 ```{r plot-loess-learning-curve}
 # Explore a flexible coding-time trend across global task order.
-ggplot(records_long,
-       aes(x = order_global, y = time, color = ai)) +
+ggplot(
+  records_long,
+  aes(x = order_global, y = time, color = ai)
+) +
   geom_point(alpha = 0.2) +
   geom_smooth(method = "loess") +
-  facet_wrap(~ group) +
+  facet_wrap(~group) +
   labs(
     title = "Learning Curve (Coding Time)",
     x = "Task Order",
@@ -894,7 +924,7 @@ Calculates response-scale marginal means and contrasts for AI use averaged acros
 
 ```{r contrast-jaccard-ai}
 # Test the average AI-use contrast across coder groups.
-emm_beta_ai <- emmeans(fit_beta, ~ ai, type = "response")
+emm_beta_ai <- emmeans(fit_beta, ~ai, type = "response")
 summary(emm_beta_ai)
 pairs(emm_beta_ai)
 confint(pairs(emm_beta_ai))
@@ -904,7 +934,7 @@ Calculates response-scale marginal means and contrasts for coder group averaged 
 
 ```{r contrast-jaccard-group}
 # Test pairwise coder-group differences averaged across AI-use conditions.
-emm_beta_group <- emmeans(fit_beta, ~ group, type = "response")
+emm_beta_group <- emmeans(fit_beta, ~group, type = "response")
 summary(emm_beta_group)
 pairs(emm_beta_group)
 ```
@@ -944,14 +974,21 @@ p_jaccard_emmeans <- ggplot(
   ) +
   # Optional: keep within Jaccard bounds (0–1) without chopping CIs off harshly
   # coord_cartesian(ylim = c(0.4, 0.8), expand = FALSE) +
-  scale_x_discrete(expand = expansion(add = 0.1)) +  # slight buffer (not 0 to avoid clipping)
+  scale_x_discrete(expand = expansion(add = 0.1)) + # slight buffer (not 0 to avoid clipping)
   coord_cartesian(ylim = c(0.4, 0.8), clip = "off") +
   theme(plot.margin = margin(10, 20, 10, 10)) +
   scale_y_continuous(
     breaks = seq(0, 1, 0.1),
     labels = function(x) sprintf("%.1f", x)
   ) +
-  scale_color_viridis_d(end = 0.9, option = "C") +
+  scale_color_manual(
+    values = csu_ai_colors,
+    breaks = c(FALSE, TRUE),
+    labels = c(
+      "Manual Coding",
+      "AI-Assisted Coding"
+    )
+  ) +
   labs(
     title = "Predicted Jaccard Agreement",
     x = "Group",
@@ -964,7 +1001,7 @@ p_jaccard_emmeans <- ggplot(
     plot.title = element_text(face = "bold", size = 22),
     plot.subtitle = element_text(size = 16, margin = margin(b = 10)),
     axis.title = element_text(size = 18),
-    axis.text  = element_text(size = 14, color = "black"),
+    axis.text = element_text(size = 14, color = "black"),
     legend.position = "right",
     legend.title = element_text(face = "bold"),
     legend.text = element_text(size = 14),
@@ -1056,7 +1093,7 @@ Calculates response-scale marginal means and contrasts for AI use in the coding-
 
 ```{r contrast-time-ai}
 # Test the average AI-use contrast for coding time.
-emm_time_ai <- emmeans(fit_time, ~ ai, type = "response")
+emm_time_ai <- emmeans(fit_time, ~ai, type = "response")
 summary(emm_time_ai)
 pairs(emm_time_ai)
 confint(pairs(emm_time_ai))
@@ -1123,14 +1160,21 @@ p_time_emmeans <- ggplot(
   ) +
   # Optional: keep within Jaccard bounds (0–1) without chopping CIs off harshly
   # coord_cartesian(ylim = c(0.4, 0.8), expand = FALSE) +
-  scale_x_discrete(expand = expansion(add = 0.1)) +  # slight buffer (not 0 to avoid clipping)
+  scale_x_discrete(expand = expansion(add = 0.1)) + # slight buffer (not 0 to avoid clipping)
   # coord_cartesian(ylim = c(0.4, 0.8), clip = "off") +
   theme(plot.margin = margin(10, 20, 10, 10)) +
   # scale_y_continuous(
   #   # breaks = seq(0, 1, 0.1),
   #   labels = function(x) sprintf("%.1f", x)
   # ) +
-  scale_color_viridis_d(end = 0.9, option = "C") +
+  scale_color_manual(
+    values = csu_ai_colors,
+    breaks = c(FALSE, TRUE),
+    labels = c(
+      "Manual Coding",
+      "AI-Assisted Coding"
+    )
+  ) +
   labs(
     title = "Predicted Coding Time",
     x = "Group",
@@ -1143,7 +1187,7 @@ p_time_emmeans <- ggplot(
     plot.title = element_text(face = "bold", size = 22),
     plot.subtitle = element_text(size = 16, margin = margin(b = 10)),
     axis.title = element_text(size = 18),
-    axis.text  = element_text(size = 14, color = "black"),
+    axis.text = element_text(size = 14, color = "black"),
     legend.position = "right",
     legend.title = element_text(face = "bold"),
     legend.text = element_text(size = 14),
@@ -1185,7 +1229,14 @@ p_beta <- ggplot(
     breaks = seq(0, 1, 0.1),
     labels = function(x) sprintf("%.1f", x)
   ) +
-  scale_color_viridis_d(end = 0.9, option = "C") +
+  scale_color_manual(
+    values = csu_ai_colors,
+    breaks = c(FALSE, TRUE),
+    labels = c(
+      "Manual Coding",
+      "AI-Assisted Coding"
+    )
+  ) +
   labs(
     title = "Predicted Jaccard\nAgreement",
     x = "Group",
@@ -1194,10 +1245,10 @@ p_beta <- ggplot(
   ) +
   theme_classic(base_size = 18) +
   theme(
-    plot.margin = margin(10, 5, 12, 10),  # more bottom space
+    plot.margin = margin(10, 5, 12, 10), # more bottom space
     plot.title = element_text(face = "bold", size = 18, margin = margin(b = 5)),
     axis.title = element_text(size = 18),
-    axis.text  = element_text(size = 14, color = "black"),
+    axis.text = element_text(size = 14, color = "black"),
     axis.text.x = element_text(margin = margin(t = 8)), # separate labels
     legend.title = element_text(face = "bold"),
     legend.text = element_text(size = 14)
@@ -1215,21 +1266,28 @@ p_time <- ggplot(
   geom_line(linewidth = 0.9) +
   geom_point(size = 3.2) +
   scale_x_discrete(expand = expansion(add = 0.4)) +
-  scale_color_viridis_d(end = 0.9, option = "C") +
+  scale_color_manual(
+    values = csu_ai_colors,
+    breaks = c(FALSE, TRUE),
+    labels = c(
+      "Manual Coding",
+      "AI-Assisted Coding"
+    )
+  ) +
   labs(
     title = "Predicted Coding\nTime",
     x = "Group",
-    y = "Predicted Time [sec]",   #  restored
+    y = "Predicted Time [sec]", #  restored
     color = "AI Use"
   ) +
   theme_classic(base_size = 18) +
   theme(
-    plot.margin = margin(10, 40, 12, 5),  #  BIG right margin (fix clipping)
+    plot.margin = margin(10, 40, 12, 5), #  BIG right margin (fix clipping)
     plot.title = element_text(face = "bold", size = 18, margin = margin(b = 5)),
     axis.title = element_text(size = 18),
-    axis.title.y = element_text(margin = margin(r = 12)),  #  push label outward
-    axis.text  = element_text(size = 14, color = "black"),
-    axis.text.x = element_text(margin = margin(t = 8)),   #  prevent overlap
+    axis.title.y = element_text(margin = margin(r = 12)), #  push label outward
+    axis.text = element_text(size = 14, color = "black"),
+    axis.text.x = element_text(margin = margin(t = 8)), #  prevent overlap
     legend.title = element_text(face = "bold"),
     legend.text = element_text(size = 14)
   )
@@ -1237,7 +1295,7 @@ p_time <- ggplot(
 # --- Combine with spacer (KEY FIX) ---
 combined <- (p_beta | plot_spacer() | p_time) +
   plot_layout(
-    widths = c(1.05, 0.06, 1.25),   #  small gap between panels
+    widths = c(1.05, 0.06, 1.25), #  small gap between panels
     guides = "collect"
   ) &
   theme(
@@ -1266,11 +1324,11 @@ Builds and saves a bar chart of manually entered GatorTron performance metrics a
 ```{r plot-gatortron-metrics}
 # Visualize externally supplied model-performance values; these values are hard-coded rather than calculated above.
 gatortron_metrics_df <- tibble::tribble(
-  ~Metric,         ~Estimate, ~CI_half,
-  "F1",              76.9,      0.14,
-  "Precision",       81.5,      1.74,
-  "Recall",          74.4,      1.14,
-  "Exact Match",     52.2,      0.66
+  ~Metric, ~Estimate, ~CI_half,
+  "F1", 76.9, 0.14,
+  "Precision", 81.5, 1.74,
+  "Recall", 74.4, 1.14,
+  "Exact Match", 52.2, 0.66
 ) %>%
   mutate(
     CI_low  = Estimate - CI_half,
@@ -1280,13 +1338,11 @@ gatortron_metrics_df <- tibble::tribble(
 
 p_bar <- ggplot(gatortron_metrics_df, aes(x = Metric, y = Estimate, fill = Metric)) +
   geom_col(width = 0.65, color = "white", linewidth = 0.4) +
-
   geom_errorbar(
     aes(ymin = CI_low, ymax = CI_high),
     width = 0.12,
     linewidth = 0.9
   ) +
-
   geom_text(
     aes(label = sprintf("%.1f%%", Estimate)),
     vjust = -2.75,
@@ -1294,34 +1350,28 @@ p_bar <- ggplot(gatortron_metrics_df, aes(x = Metric, y = Estimate, fill = Metri
     color = "black",
     fontface = "bold"
   ) +
-
   geom_text(
     aes(label = sprintf("[%.1f, %.1f]", CI_low, CI_high)),
     vjust = -2.0, size = 4
   ) +
-
   scale_y_continuous(
     breaks = seq(50, 100, 10),
     labels = function(x) sprintf("%.0f%%", x)
   ) +
-
   coord_cartesian(ylim = c(50, 100), expand = FALSE) +
-
-  scale_fill_viridis_d(end = 0.9, option = "C", guide = "none") +
-
+  scale_fill_manual(values = csu_palette_4) +
   labs(
     title = "GatorTron Model Performance",
     x = NULL,
     y = "Score"
   ) +
-
   theme_classic(base_size = 18) +
   theme(
     plot.title.position = "plot",
     plot.title = element_text(face = "bold", size = 22),
     plot.subtitle = element_text(size = 16, margin = margin(b = 10)),
     axis.title = element_text(size = 18),
-    axis.text  = element_text(size = 16, color = "black"),
+    axis.text = element_text(size = 16, color = "black"),
     axis.text.x = element_text(face = "bold"),
     panel.grid = element_blank()
   )
