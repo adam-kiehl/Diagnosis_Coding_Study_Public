@@ -527,8 +527,9 @@ fit_time_model <- function(data) {
 extract_time_ai_pvalue <- function(fit) {
   emm_condition <- emmeans::emmeans(
     fit,
-    ~condition,
-    type = "response"
+    ~ condition,
+    type = "response",
+    lmer.df = "satterthwaite"
   )
 
   emmeans::contrast(
@@ -545,7 +546,12 @@ extract_time_ai_pvalue <- function(fit) {
 # Q4 target: three coder-group comparisons averaged over condition.
 # Tukey adjustment is applied to the family of three comparisons.
 extract_time_group_pvalues <- function(fit) {
-  emm_group <- emmeans::emmeans(fit, ~group, type = "response")
+  emm_group <- emmeans::emmeans(
+    fit,
+    ~ group,
+    type = "response",
+    lmer.df = "satterthwaite"
+  )
 
   emmeans::contrast(
     emm_group,
