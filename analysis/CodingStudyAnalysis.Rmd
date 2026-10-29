@@ -509,6 +509,100 @@ jaccard_by_record_group %>%
 ### 2.2 AI Suggestion Acceptance
 
 ```{r}
+predictions_raw <- jsonlite::fromJSON(
+  "gatortron_predictions.json",
+  simplifyVector = FALSE
+)
+
+predictions_df <- tibble(
+  record_id = as.integer(names(predictions_raw)),
+  predicted_codes = unname(predictions_raw)
+) %>%
+  mutate(
+    predicted_codes = map(
+      predicted_codes,
+      ~ sort(unique(as.character(.x)))
+    )
+  )
+
+split_response_codes <- function(value) {
+  # Each call should receive one dataframe cell
+  if (length(value) == 0L || is.null(value) || all(is.na(value))) {
+    return(character(0))
+  }
+
+  # Explicitly coerce factors, integers, and other atomic values to text
+  value <- as.character(value[[1]])
+
+  if (is.na(value) || trimws(value) == "") {
+    return(character(0))
+  }
+
+  # Split on one or more whitespace characters
+  result <- unlist(
+    strsplit(trimws(value), split = "\\s+"),
+    use.names = FALSE
+  )
+
+  # Remove blanks and duplicates, then sort for reproducibility
+  sort(unique(result[nzchar(result)]))
+}
+```
+
+```{r}
+ai_comparison <- records_long %>%
+  dplyr::filter(.data$ai %in% TRUE) %>%
+  dplyr::mutate(
+    record_id = as.integer(.data$record_id),
+    group = as.character(.data$group),
+
+    # Explicit package and column references prevent name collisions
+    response_codes = purrr::map(
+      as.character(.data$codes),
+      split_response_codes
+    )
+  ) %>%
+  dplyr::left_join(
+    predictions_df,
+    by = "record_id"
+  )
+
+# Stop if any AI-assisted responses do not have corresponding JSON predictions.
+missing_prediction_ids <- ai_comparison %>%
+  filter(map_lgl(predicted_codes, is.null)) %>%
+  distinct(record_id) %>%
+  pull(record_id)
+
+if (length(missing_prediction_ids) > 0L) {
+  stop(
+    "No model predictions were found for these record_id values: ",
+    paste(missing_prediction_ids, collapse = ", ")
+  )
+}
+
+ai_comparison <- ai_comparison %>%
+  mutate(
+    # Number of unique codes submitted in each response
+    n_response_codes = map_int(response_codes, length),
+
+    # Number of submitted codes that were also AI predictions
+    accepted_codes = map2(
+      response_codes,
+      predicted_codes,
+      intersect
+    ),
+    n_accepted_codes = map_int(accepted_codes, length),
+
+    # Exact set equality, independent of order
+    perfect_match = map2_lgl(
+      response_codes,
+      predicted_codes,
+      setequal
+    )
+  )
+```
+
+```{r}
 ai_overlap_table <- ai_comparison %>%
   mutate(
     response_codes = map(response_codes, unique),
