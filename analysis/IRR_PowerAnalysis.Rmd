@@ -18,6 +18,10 @@ library(glmmTMB)
 library(emmeans)
 library(glue)
 library(scales)
+library(future)
+library(furrr)
+library(parallelly)
+library(progressr)
 ```
 
 # Overview
@@ -139,6 +143,56 @@ report_minimum_N <- function(results, question_label) {
     ) |>
     mutate(question = question_label, .before = 1)
 }
+```
+
+```{r parallel-configuration}
+# Leave at least one logical core available for the operating system.
+available_cores <- parallelly::availableCores()
+n_workers <- min(4L, parallelly::availableCores() - 1L)
+
+future::plan(
+  future::multisession,
+  workers = n_workers
+)
+
+# Prevent nested numerical-library threading inside each R worker.
+# Otherwise, each worker may attempt to use multiple CPU threads.
+Sys.setenv(
+  OMP_NUM_THREADS = "1",
+  OPENBLAS_NUM_THREADS = "1",
+  MKL_NUM_THREADS = "1",
+  VECLIB_MAXIMUM_THREADS = "1"
+)
+
+# Use the faster Satterthwaite method for lmer-based emmeans calls.
+emmeans::emm_options(
+  lmer.df = "satterthwaite",
+  disable.pbkrtest = TRUE
+)
+
+message(
+  "Using ", n_workers,
+  " parallel workers out of ",
+  available_cores,
+  " available cores."
+)
+
+parallel_options <- furrr::furrr_options(
+  seed = TRUE,
+  scheduling = Inf,
+  packages = c(
+    "tidyverse",
+    "lme4",
+    "lmerTest",
+    "glmmTMB",
+    "emmeans"
+  )
+)
+
+# Configure progress bars for parallel furrr jobs.
+# Use progressr's built-in text handler for compatibility across versions.
+options(progressr.enable = TRUE)
+progressr::handlers("txtprogressbar")
 ```
 
 # Jaccard agreement simulation
@@ -322,20 +376,33 @@ run_jaccard_once <- function(N, delta_AI, target = c("group", "AI")) {
 Does marginal Jaccard agreement differ between AI-assisted and manual coding? The target is the AI-versus-manual contrast averaged equally over coder groups, matching `emmeans(fit, ~ condition, type = "response")` followed by `pairs()`.
 
 ```{r q1-power}
-q1_results <- purrr::map_dfr(N_grid, function(N) {
-  p_values <- replicate(
-    reps,
-    run_jaccard_once(
-      N = N,
-      delta_AI = 0.05,
-      target = "AI"
-    )
-  )
+q1_results <- progressr::with_progress({
+  progress <- progressr::progressor(along = N_grid)
 
-  tibble(
-    N = N,
-    power = mean(p_values < alpha, na.rm = TRUE)
-  )
+  purrr::map_dfr(N_grid, function(N) {
+    message("Q1: starting N = ", N)
+
+    p_values <- furrr::future_map_dbl(
+      seq_len(reps),
+      function(i) {
+        run_jaccard_once(
+          N = N,
+          delta_AI = 0.05,
+          target = "AI"
+        )
+      },
+      .options = parallel_options
+    )
+
+    result <- tibble(
+      N = N,
+      successful_fits = sum(!is.na(p_values)),
+      power = mean(p_values < alpha, na.rm = TRUE)
+    )
+
+    progress(message = paste0("Q1 completed N = ", N))
+    result
+  })
 })
 
 q1_plot <- ggplot(q1_results, aes(x = N, y = power)) +
@@ -358,23 +425,36 @@ Does marginal Jaccard agreement vary between coder groups? This analysis estimat
 For this question, the AI lift remains zero so that the generating signal is the prespecified difference among manual-condition group means.
 
 ```{r q2-power}
-q2_results <- purrr::map_dfr(N_grid, function(N) {
-  sim_results <- purrr::map_dfr(seq_len(reps), function(i) {
-    run_jaccard_once(
-      N = N,
-      delta_AI = 0.00,
-      target = "group"
-    )
-  })
+q2_results <- progressr::with_progress({
+  progress <- progressr::progressor(along = N_grid)
 
-  sim_results |>
-    group_by(contrast) |>
-    summarise(
-      N = N,
-      successful_fits = sum(!is.na(p_value)),
-      power = mean(p_value < alpha, na.rm = TRUE),
-      .groups = "drop"
+  purrr::map_dfr(N_grid, function(N) {
+    message("Q2: starting N = ", N)
+
+    sim_results <- furrr::future_map_dfr(
+      seq_len(reps),
+      function(i) {
+        run_jaccard_once(
+          N = N,
+          delta_AI = 0.00,
+          target = "group"
+        )
+      },
+      .options = parallel_options
     )
+
+    result <- sim_results |>
+      group_by(contrast) |>
+      summarise(
+        N = N,
+        successful_fits = sum(!is.na(p_value)),
+        power = mean(p_value < alpha, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    progress(message = paste0("Q2 completed N = ", N))
+    result
+  })
 })
 
 if (all(q2_results$successful_fits == 0)) {
@@ -527,7 +607,7 @@ fit_time_model <- function(data) {
 extract_time_ai_pvalue <- function(fit) {
   emm_condition <- emmeans::emmeans(
     fit,
-    ~ condition,
+    ~condition,
     type = "response",
     lmer.df = "satterthwaite"
   )
@@ -548,7 +628,7 @@ extract_time_ai_pvalue <- function(fit) {
 extract_time_group_pvalues <- function(fit) {
   emm_group <- emmeans::emmeans(
     fit,
-    ~ group,
+    ~group,
     type = "response",
     lmer.df = "satterthwaite"
   )
@@ -614,21 +694,34 @@ run_time_once <- function(
 Does marginal coding time differ between AI-assisted and manual coding? The target is the AI-versus-manual contrast averaged equally over coder groups, matching `emmeans(fit, ~ condition, type = "response")` followed by a single unadjusted pairwise contrast.
 
 ```{r q3-power}
-q3_results <- purrr::map_dfr(N_grid, function(N) {
-  p_values <- replicate(
-    reps,
-    run_time_once(
-      N = N,
-      ai_ratio = 0.80,
-      sd_resid = sd_resid_time_ai,
-      target = "AI"
-    )
-  )
+q3_results <- progressr::with_progress({
+  progress <- progressr::progressor(along = N_grid)
 
-  tibble(
-    N = N,
-    power = mean(p_values < alpha, na.rm = TRUE)
-  )
+  purrr::map_dfr(N_grid, function(N) {
+    message("Q3: starting N = ", N)
+
+    p_values <- furrr::future_map_dbl(
+      seq_len(reps),
+      function(i) {
+        run_time_once(
+          N = N,
+          ai_ratio = 0.80,
+          sd_resid = sd_resid_time_ai,
+          target = "AI"
+        )
+      },
+      .options = parallel_options
+    )
+
+    result <- tibble(
+      N = N,
+      successful_fits = sum(!is.na(p_values)),
+      power = mean(p_values < alpha, na.rm = TRUE)
+    )
+
+    progress(message = paste0("Q3 completed N = ", N))
+    result
+  })
 })
 
 q3_plot <- ggplot(q3_results, aes(x = N, y = power)) +
@@ -649,24 +742,37 @@ report_minimum_N(q3_results, "Q3")
 Does marginal coding time vary among coder groups? This analysis estimates power separately for the three pairwise group contrasts averaged over AI condition. The p-values are Tukey-adjusted within each simulated dataset. For this question, `ai_ratio = 1.00`, so no AI effect is generated.
 
 ```{r q4-power}
-q4_results <- purrr::map_dfr(N_grid, function(N) {
-  sim_results <- purrr::map_dfr(seq_len(reps), function(i) {
-    run_time_once(
-      N = N,
-      ai_ratio = 1.00,
-      sd_resid = sd_resid_time_group,
-      target = "group"
-    )
-  })
+q4_results <- progressr::with_progress({
+  progress <- progressr::progressor(along = N_grid)
 
-  sim_results |>
-    group_by(contrast) |>
-    summarise(
-      N = N,
-      successful_fits = sum(!is.na(p_value)),
-      power = mean(p_value < alpha, na.rm = TRUE),
-      .groups = "drop"
+  purrr::map_dfr(N_grid, function(N) {
+    message("Q4: starting N = ", N)
+
+    sim_results <- furrr::future_map_dfr(
+      seq_len(reps),
+      function(i) {
+        run_time_once(
+          N = N,
+          ai_ratio = 1.00,
+          sd_resid = sd_resid_time_group,
+          target = "group"
+        )
+      },
+      .options = parallel_options
     )
+
+    result <- sim_results |>
+      group_by(contrast) |>
+      summarise(
+        N = N,
+        successful_fits = sum(!is.na(p_value)),
+        power = mean(p_value < alpha, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    progress(message = paste0("Q4 completed N = ", N))
+    result
+  })
 })
 
 if (all(q4_results$successful_fits == 0)) {
@@ -691,4 +797,8 @@ q4_plot <- ggplot(
 
 print(add_power_references(q4_plot))
 report_minimum_N(q4_results, "Q4")
+```
+
+```{r}
+future::plan(future::sequential)
 ```
