@@ -1,0 +1,1754 @@
+---
+title: "AI Coding Study Analysis"
+author: "Adam Kiehl"
+date: "2026-04-16"
+output: pdf_document
+---
+
+## Analysis Overview
+
+This document imports and reshapes coding-study data, quantifies inter-coder agreement, models agreement and coding time, and produces diagnostic and presentation figures. Code statements from the source file are preserved; organizational prose, chunk labels, and comments have been added for maintainability.
+
+```{r setup, include=FALSE}
+# Set global chunk behavior and attach analysis dependencies.
+knitr::opts_chunk$set(echo = TRUE)
+
+# Create the figure output directory when it does not already exist.
+dir.create("plots", showWarnings = FALSE, recursive = TRUE)
+
+library(tidyverse)
+library(jaccard)
+library(lme4)
+library(lmerTest)
+library(scales)
+library(viridis)
+library(glmmTMB)
+library(DHARMa)
+library(performance)
+library(emmeans)
+library(patchwork)
+library(brms)
+library(posterior)
+library(bayesplot)
+
+# Colorado State University brand colors used for AI-condition plots
+csu_ai_colors <- c(
+  "FALSE" = "#1E4D2B", # Colorado State Green: manual coding
+  "TRUE"  = "#D9782D" # Aggie Orange: AI-assisted coding
+)
+# Three-level CSU palette
+csu_palette_3 <- c(
+  "#1E4D2B", # Colorado State Green
+  "#D9782D", # Aggie Orange
+  "#C8C372" # Colorado State Gold
+)
+# Four-level CSU Energy palette
+csu_palette_4 <- c(
+  "#82C503", # Lovers Lane
+  "#E56A54", # Flower Trial Red
+  "#7E5475", # Powered Purple
+  "#008FB3" # Horsetooth Blue
+)
+```
+
+## 1. Data Engineering
+
+### 1.1 Import Data
+
+Imports the coding records, reports their structure, removes unused columns, and retains complete coder observations.
+
+```{r import-records}
+# Read, inspect, reduce, and completeness-filter the primary record-level dataset.
+# 1) Import the CSV
+raw_data <- readr::read_csv("../data_entry/records_df.csv", show_col_types = FALSE)
+
+# 2) Print a summary including column dtypes and total number of rows
+cat("=== DataFrame Summary ===\n")
+cat("Total rows:", nrow(raw_data), "\n")
+cat("Total columns:", ncol(raw_data), "\n\n")
+
+# Column dtypes + preview (built-in tidyverse helper)
+dplyr::glimpse(raw_data)
+
+# 3) Drop specified columns
+records_df <- raw_data %>%
+  dplyr::select(-dplyr::any_of(c("diagnosis", "assessment", "pathology")))
+
+# 4) Filter for rows with non-empty values in ALL listed columns
+required_cols <- c("nadia", "katie", "terri", "beth", "naija", "erik", "caitlin", "tracy")
+
+records_df <- records_df %>%
+  dplyr::filter(
+    dplyr::if_all(
+      dplyr::all_of(required_cols),
+      ~ !is.na(.) &
+        stringr::str_trim(as.character(.)) != "" &
+        stringr::str_trim(as.character(.)) != "nan"
+    )
+  )
+
+# 5) Report the updated row count
+cat("\n=== After Dropping Columns + Filtering ===\n")
+cat("Updated rows:", nrow(records_df), "\n")
+
+# 6) Print the head of the dataframe
+cat("\n=== Head of DataFrame ===\n")
+print(head(records_df))
+```
+
+### 1.2 Reference Code Dictionary
+
+Imports and cleans the master list of allowable codes used as the one-hot encoding reference.
+
+```{r import-reference-codes}
+# Build a stable numeric reference vector from the external code dictionary.
+# Import reference codes
+all_codes_df <- readr::read_csv("all_codes.csv", col_types = cols(.default = col_character()))
+
+# Pull first column as the reference list (works whether the column is named or not)
+all_codes <- all_codes_df %>%
+  dplyr::pull(1) %>%
+  stringr::str_trim() %>%
+  .[. != "" & !is.na(.)] %>%
+  suppressWarnings(as.numeric()) %>% # convert valid code strings to numeric values
+  .[!is.na(.)] %>% # remove entries that could not be parsed as codes
+  unique()
+
+# Optional: keep reference codes in a stable order
+all_codes <- sort(all_codes)
+
+cat("Number of Codes:", length(all_codes), "\n")
+```
+
+### 1.3 Data Reshaping
+
+Reshapes coder-specific columns into one row per record and coder, then assigns each coder to an experience group.
+
+```{r reshape-records-long}
+# Standardize coder columns before pivoting them to a tidy long representation.
+subjects <- c("nadia", "katie", "terri", "beth", "naija", "erik", "caitlin", "tracy")
+
+records_long <- records_df %>%
+  rename_with(~ paste0("codes_", .x), .cols = any_of(subjects)) %>%
+  pivot_longer(
+    cols = matches("^(codes|time|order)_"),
+    names_to = c(".value", "coder"),
+    names_sep = "_"
+  ) %>%
+  mutate(
+    group = case_when(
+      coder %in% c("nadia", "katie", "tracy") ~ "clinicians",
+      coder %in% c("terri", "beth") ~ "coders",
+      coder %in% c("naija", "erik", "caitlin") ~ "students",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(record_id, ai, coder, group, codes, time, order) %>%
+  arrange(record_id, match(coder, subjects))
+```
+
+### 1.4 Feature Engineering
+
+Calculates character length from diagnosis and assessment text as a record-level covariate. Adds the record-level text-length covariate to the long-format coding data.
+
+```{r record-text-length}
+# Use source text from raw_data because diagnosis and assessment were removed from records_df.
+record_lens <- raw_data %>%
+  mutate(
+    combined_text = paste(diagnosis, assessment, sep = " "),
+    text_length   = nchar(combined_text)
+  ) %>%
+  select(c(record_id, text_length))
+
+# Join the record-level covariate while retaining the current row order and all coder observations.
+records_long <- records_long %>%
+  dplyr::left_join(record_lens, by = "record_id")
+
+head(records_long)
+```
+
+Defines helpers for pairwise Jaccard similarity and the mean similarity across all coder pairs.
+
+```{r define-jaccard-functions}
+# Keep similarity calculations in reusable helpers so the grouped analysis remains readable.
+# Function to calculate pairwise Jaccard score
+jaccard_pairwise <- function(rater1, rater2) {
+  return(jaccard::jaccard(rater1, rater2))
+}
+
+# Helper: average of all pairwise jaccards in a list of one-hot vectors
+avg_pairwise_jaccard <- function(onehot_list) {
+  # keep only non-null vectors
+  onehot_list <- onehot_list[!vapply(onehot_list, is.null, logical(1))]
+
+  n <- length(onehot_list)
+  if (n < 2) {
+    return(NA_real_)
+  }
+
+  pairs <- combn(n, 2)
+
+  scores <- purrr::map_dbl(seq_len(ncol(pairs)), function(k) {
+    v1 <- onehot_list[[pairs[1, k]]]
+    v2 <- onehot_list[[pairs[2, k]]]
+    s <- jaccard_pairwise(v1, v2)
+
+    # If both vectors are all-zeros, some implementations return NaN (0/0).
+    # Common convention for Jaccard(empty, empty) is 1. Adjust if you prefer 0.
+    if (is.nan(s)) {
+      s <- 1
+    }
+    s
+  })
+
+  mean(scores, na.rm = TRUE)
+}
+```
+
+Defines a parser that converts newline-separated code strings into unique numeric code vectors.
+
+```{r define-code-parser}
+# Normalize stored code text before it is encoded for agreement calculations.
+# Convert newline-separated code text into a numeric vector
+codes_text_to_numeric <- function(x, unique_codes = TRUE) {
+  # Treat NA as empty
+  if (is.na(x)) {
+    return(numeric(0))
+  }
+
+  # Coerce to character in case a factor slips in
+  x <- as.character(x)
+
+  # Trim overall string; if empty after trim, return empty vector
+  x_trim <- stringr::str_trim(x)
+  if (identical(x_trim, "") ||
+    nchar(x_trim) == 0) {
+    return(numeric(0))
+  }
+
+  # Split on any line break (\n, \r\n, \r)
+  parts <- stringr::str_split(x_trim, pattern = "\\r?\\n|\\r")[[1]]
+
+  # Trim each element and drop empties
+  parts <- stringr::str_trim(parts)
+  parts <- parts[parts != ""]
+
+  if (length(parts) == 0) {
+    return(numeric(0))
+  }
+
+  # Convert to numeric
+  nums <- suppressWarnings(as.numeric(parts))
+
+  # Drop any non-numeric entries (if present)
+  nums <- nums[!is.na(nums)]
+
+  if (unique_codes) {
+    nums <- unique(nums)
+  }
+
+  nums
+}
+```
+
+Defines a helper that maps each code vector to a binary vector aligned with the reference code list.
+
+```{r define-one-hot-encoder}
+# Encode observed codes against all_codes so every coder vector has identical length and order.
+# One-hot encode a numeric code vector against the all_codes reference list
+one_hot_encode_codes <- function(codes_vec, ref_codes = all_codes) {
+  # Handle NULL / NA / empty
+  if (is.null(codes_vec) ||
+    length(codes_vec) == 0 || all(is.na(codes_vec))) {
+    out <- integer(length(ref_codes))
+    names(out) <- as.character(ref_codes)
+    return(out)
+  }
+
+  # Ensure numeric + unique to avoid redundant indexing
+  codes_vec <- unique(as.numeric(codes_vec))
+  codes_vec <- codes_vec[!is.na(codes_vec)]
+
+  out <- integer(length(ref_codes))
+  names(out) <- as.character(ref_codes)
+
+  # Efficient set membership via match (faster than %in% for large vectors)
+  idx <- match(codes_vec, ref_codes, nomatch = 0L)
+  idx <- idx[idx > 0L]
+  if (length(idx) > 0L) {
+    out[idx] <- 1L
+  }
+
+  out
+}
+```
+
+Calculates average pairwise Jaccard agreement for every record and coder group, including missing record-group combinations.
+
+```{r calculate-group-jaccard}
+# Create a complete record-by-group agreement table for modeling and plotting.
+# Define the groups you expect (so we can guarantee one row per record/group)
+group_levels <- c("clinicians", "coders", "students")
+
+# Compute avg pairwise jaccard per record/group
+ai_by_record <- records_long %>%
+  distinct(record_id, ai)
+
+jaccard_by_record_group <- records_long %>%
+  mutate(
+    codes_vec = purrr::map(codes, codes_text_to_numeric),
+    onehot    = purrr::map(codes_vec, one_hot_encode_codes, ref_codes = all_codes)
+  ) %>%
+  group_by(record_id, group) %>%
+  summarise(
+    ai = first(ai),
+    # ai is constant within record
+    jaccard_avg = avg_pairwise_jaccard(onehot),
+    .groups = "drop"
+  ) %>%
+  # ensure one row per group per record_id
+  right_join(
+    tidyr::expand_grid(record_id = sort(unique(
+      records_long$record_id
+    )), group = group_levels),
+    by = c("record_id", "group")
+  ) %>%
+  left_join(ai_by_record, by = "record_id", suffix = c("", ".ref")) %>%
+  mutate(
+    ai = coalesce(ai, ai.ref),
+    group = factor(group, levels = group_levels)
+  ) %>%
+  select(record_id, ai, group, jaccard_avg) %>%
+  arrange(record_id, group)
+```
+
+Adds record text length to the record-by-group Jaccard analysis table.
+
+```{r join-jaccard-text-length}
+# Join the text-length adjustment variable while retaining all rows in the Jaccard outcome table.
+jaccard_by_record_group <- jaccard_by_record_group %>%
+  dplyr::left_join(record_lens, by = "record_id")
+
+jaccard_by_record_group
+```
+
+Creates a coder-specific global task-order variable for the coding-time model.
+
+```{r create-global-task-order}
+# Construct sequential task order within coder for use as a fixed effect.
+records_long <- records_long %>%
+  group_by(coder) %>%
+  arrange(order, .by_group = TRUE) %>%
+  mutate(order_global = row_number()) %>%
+  ungroup()
+```
+
+## 2. Exploratory Analysis
+
+### 2.1 Exploratory Tables
+
+Computes the average number of assigned codes for each condition.
+
+```{r summarize-code-counts2}
+# Count whitespace-delimited code tokens, preserving missing values separately from empty strings.
+avg_n_codes <- records_long %>%
+  mutate(
+    n_codes = case_when(
+      is.na(codes) ~ NA_real_,
+      str_trim(codes) == "" ~ 0,
+      TRUE ~ str_count(str_trim(codes), "\\S+")
+    )
+  ) %>%
+  group_by(ai) %>%
+  summarise(
+    avg_n_codes = mean(n_codes, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+avg_n_codes
+```
+
+Computes the average number of assigned codes for each coder group.
+
+```{r summarize-code-counts}
+# Count whitespace-delimited code tokens, preserving missing values separately from empty strings.
+avg_n_codes <- records_long %>%
+  mutate(
+    n_codes = case_when(
+      is.na(codes) ~ NA_real_,
+      str_trim(codes) == "" ~ 0,
+      TRUE ~ str_count(str_trim(codes), "\\S+")
+    )
+  ) %>%
+  group_by(group) %>%
+  summarise(
+    avg_n_codes = mean(n_codes, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+avg_n_codes
+```
+
+Summarizes coding-time distribution by AI-use condition.
+
+```{r summarize-time-by-ai}
+time_by_condition <- records_long %>%
+  group_by(ai) %>%
+  rename(Condition = ai) %>%
+  summarise(
+    N = sum(!is.na(time)),
+    Mean = mean(time, na.rm = TRUE),
+    Median = median(time, na.rm = TRUE),
+    SD = sd(time, na.rm = TRUE),
+    IQR = IQR(time, na.rm = TRUE),
+    Min = min(time, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 1))
+
+time_by_condition
+```
+
+Summarizes coding-time means and standard deviations by coder group.
+
+```{r summarize-time-by-group}
+# Produce an unadjusted descriptive summary of coding time by experience group.
+records_long %>%
+  group_by(group) %>%
+  summarise(
+    N = sum(!is.na(time)),
+    Mean = mean(time, na.rm = TRUE),
+    Median = median(time, na.rm = TRUE),
+    SD = sd(time, na.rm = TRUE),
+    IQR = IQR(time, na.rm = TRUE),
+    Min = min(time, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 1))
+```
+
+Summarizes coding-time distribution by AI-use condition and coder group.
+
+```{r}
+time_by_condition_group <- records_long %>%
+  group_by(ai, group) %>%
+  rename(
+    Condition = ai,
+    Group = group
+  ) %>%
+  summarise(
+    N = sum(!is.na(time)),
+    Mean = mean(time, na.rm = TRUE),
+    Median = median(time, na.rm = TRUE),
+    SD = sd(time, na.rm = TRUE),
+    IQR = IQR(time, na.rm = TRUE),
+    Min = min(time, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 1))
+
+time_by_condition_group
+```
+
+Summarizes Jaccard means and standard deviations by AI-use condition.
+
+```{r summarize-jaccard-by-ai}
+# Produce an unadjusted descriptive summary of agreement by AI-use condition.
+jaccard_by_record_group %>%
+  group_by(ai) %>%
+  rename(Condition = ai) %>%
+  summarize(
+    N = sum(!is.na(jaccard_avg)),
+    Mean = mean(jaccard_avg, na.rm = TRUE),
+    Median = median(jaccard_avg, na.rm = TRUE),
+    SD = sd(jaccard_avg, na.rm = TRUE),
+    IQR = IQR(jaccard_avg, na.rm = TRUE),
+    "% Perfect Agreement" = 100 * mean(jaccard_avg == 1, na.rm = TRUE),
+    "% Perfect Disagreement" = 100 * mean(jaccard_avg == 0, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 2))
+```
+
+Summarizes Jaccard means and standard deviations by coder group.
+
+```{r summarize-jaccard-by-group}
+# Produce an unadjusted descriptive summary of agreement by experience group.
+jaccard_by_record_group %>%
+  group_by(group) %>%
+  rename(Group = group) %>%
+  summarize(
+    N = sum(!is.na(jaccard_avg)),
+    Mean = mean(jaccard_avg, na.rm = TRUE),
+    Median = median(jaccard_avg, na.rm = TRUE),
+    SD = sd(jaccard_avg, na.rm = TRUE),
+    IQR = IQR(jaccard_avg, na.rm = TRUE),
+    "% Perfect Agreement" = 100 * mean(jaccard_avg == 1, na.rm = TRUE),
+    "% Perfect Disagreement" = 100 * mean(jaccard_avg == 0, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 2))
+```
+
+Summarize Jaccard boundary values by AI-use condition.
+
+```{r}
+jaccard_by_record_group %>%
+  group_by(ai, group) %>%
+  rename(
+    Condition = ai,
+    Group = group
+  ) %>%
+  summarize(
+    N = sum(!is.na(jaccard_avg)),
+    Mean = mean(jaccard_avg, na.rm = TRUE),
+    Median = median(jaccard_avg, na.rm = TRUE),
+    SD = sd(jaccard_avg, na.rm = TRUE),
+    IQR = IQR(jaccard_avg, na.rm = TRUE),
+    "% Perfect Agreement" = 100 * mean(jaccard_avg == 1, na.rm = TRUE),
+    "% Perfect Disagreement" = 100 * mean(jaccard_avg == 0, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 2))
+```
+
+### 2.2 AI Suggestion Acceptance
+
+```{r ai-suggestion-acceptance}
+# The uploaded source referenced ai_comparison without creating it. Construct it from
+# raw_data when the required columns are present; otherwise skip only this optional
+# overlap summary so the full document remains executable from a clean R session.
+ai_comparison <- if (all(c("response_codes", "predicted_codes", "group") %in% names(raw_data))) {
+  raw_data %>%
+    transmute(
+      response_codes = purrr::map(response_codes, codes_text_to_numeric),
+      predicted_codes = purrr::map(predicted_codes, codes_text_to_numeric),
+      group = as.character(group)
+    )
+} else {
+  NULL
+}
+
+if (is.null(ai_comparison)) {
+  overlap_summary <- tibble::tibble(
+    Note = paste(
+      "AI suggestion-acceptance analysis was not run because raw_data does not",
+      "contain response_codes, predicted_codes, and group columns."
+    )
+  )
+  overlap_summary
+} else {
+  ai_overlap_table <- ai_comparison %>%
+    mutate(
+      response_codes = map(response_codes, unique),
+      predicted_codes = map(predicted_codes, unique),
+      n_submitted = map_int(response_codes, length),
+      n_suggested = map_int(predicted_codes, length),
+      n_overlap = map2_int(
+        response_codes,
+        predicted_codes,
+        ~ length(intersect(.x, .y))
+      ),
+      n_added = n_submitted - n_overlap,
+      n_omitted = n_suggested - n_overlap,
+      any_added = n_added > 0,
+      any_omitted = n_omitted > 0,
+      exact_match = map2_lgl(
+        response_codes,
+        predicted_codes,
+        ~ setequal(.x, .y)
+      )
+    )
+
+  summarise_overlap <- function(data) {
+    tibble(
+      `Submitted-code overlap` =
+        sum(data$n_overlap) / sum(data$n_submitted),
+      `Suggestion acceptance` =
+        sum(data$n_overlap) / sum(data$n_suggested),
+      `Added-code rate` =
+        sum(data$n_added) / sum(data$n_submitted),
+      `Responses with >=1 added code` =
+        mean(data$any_added),
+      `Responses with >=1 omitted suggestion` =
+        mean(data$any_omitted),
+      `Exact-set match` =
+        mean(data$exact_match)
+    ) %>%
+      pivot_longer(
+        everything(),
+        names_to = "measure",
+        values_to = "proportion"
+      )
+  }
+
+  overall_overlap <- summarise_overlap(ai_overlap_table) %>%
+    mutate(group = "Overall")
+
+  group_overlap <- ai_overlap_table %>%
+    group_split(group) %>%
+    map_dfr(
+      ~ summarise_overlap(.x) %>%
+        mutate(group = as.character(first(.x$group)))
+    )
+
+  overlap_summary <- bind_rows(
+    overall_overlap,
+    group_overlap
+  ) %>%
+    mutate(percentage = 100 * proportion) %>%
+    select(measure, group, percentage) %>%
+    pivot_wider(
+      names_from = group,
+      values_from = percentage
+    ) %>%
+    rename(
+      Measure = measure,
+      Clinicians = clinicians,
+      Coders = coders,
+      Students = students
+    ) %>%
+    mutate(across(where(is.numeric), round, digits = 1))
+
+  overlap_summary
+}
+```
+
+### 2.3 Exploratory Plots
+
+Creates and saves faceted histograms of record-level Jaccard agreement by AI use and coder group.
+
+```{r plot-jaccard-distribution}
+# Prepare display labels, facet summaries, and the final agreement histogram.
+jaccard_hist_df <- jaccard_by_record_group %>%
+  rename(`AI Use` = ai, Group = group) %>%
+  mutate(
+    `AI Use` = case_when(
+      `AI Use` == TRUE ~ "AI-Assisted Coding",
+      `AI Use` == FALSE ~ "Manual Coding",
+      TRUE ~ NA_character_
+    ),
+    Group = toupper(Group),
+    # Nice ordering & stable legend
+    `AI Use` = factor(`AI Use`, levels = c("Manual Coding", "AI-Assisted Coding"))
+  ) %>%
+  filter(!is.na(`AI Use`), !is.na(Group), !is.na(jaccard_avg))
+
+jaccard_vline_df <- jaccard_hist_df %>%
+  group_by(`AI Use`) %>%
+  summarise(
+    mean_jaccard = mean(jaccard_avg, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_jaccard_hist <- ggplot(jaccard_hist_df, aes(x = jaccard_avg, fill = Group)) +
+  geom_histogram(
+    binwidth = 0.05,
+    boundary = 0,
+    closed = "left",
+    color = "white",
+    linewidth = 0.25
+  ) +
+  geom_vline(
+    data = jaccard_vline_df,
+    aes(xintercept = mean_jaccard),
+    color = "black",
+    linetype = "22",
+    # clean dashed
+    linewidth = 0.5
+  ) +
+  geom_text(
+    data = jaccard_vline_df,
+    aes(
+      x = mean_jaccard,
+      y = Inf,
+      label = paste0("Mean = ", round(mean_jaccard, 2)),
+      hjust = ifelse(mean_jaccard > 0.8, 1.1, -0.1) # shift left if near 1
+    ),
+    vjust = 1.3,
+    inherit.aes = FALSE,
+    size = 4.5
+  ) +
+  facet_grid(`AI Use` ~ .) +
+  coord_cartesian(xlim = c(0, 1), expand = FALSE) +
+  scale_x_continuous(
+    breaks = seq(0, 1, 0.2),
+    labels = function(x) {
+      ifelse(x %in% c(0, 1), sprintf("%.1f", x), sprintf("%.1f", x))
+    }
+  ) +
+  scale_fill_manual(values = csu_palette_3) +
+  labs(
+    # title = "Inter-Coder Reliability",
+    # subtitle = "per record x group",
+    # subtitle = "Faceted by AI usage; dashed line indicates mean within facet",
+    x = "Jaccard Index",
+    y = "Count",
+    fill = "Group"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(face = "bold", size = 22),
+    plot.subtitle = element_text(size = 16, margin = margin(b = 10)),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14, color = "black"),
+    strip.text = element_text(face = "bold", size = 16),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 14),
+    panel.grid = element_blank(),
+    panel.spacing.x = unit(0.6, "lines"),
+    # small increase only
+    panel.spacing.y = unit(0.8, "lines"),
+    axis.text.x = element_text(margin = margin(t = 5))
+  )
+
+p_jaccard_hist
+
+ggsave(
+  "../plots/jaccard_hist.png",
+  plot = p_jaccard_hist,
+  width = 8,
+  height = 8,
+  # <-- increase this
+  dpi = 300
+)
+```
+
+Creates and saves a faceted coding-time trend plot by AI use and coder group.
+
+```{r plot-coding-speed}
+# Re-index task order within coder and AI condition before plotting coding-time trajectories.
+coding_speed_df <- records_long %>%
+  group_by(coder, ai) %>%
+  arrange(order, .by_group = TRUE) %>% # preserves the intended sequence
+  mutate(order = row_number()) %>% # re-index within coder × ai
+  ungroup() %>%
+  rename(`AI Use` = ai) %>%
+  mutate(
+    `AI Use` = case_when(
+      `AI Use` == TRUE ~ "AI-Assisted Coding",
+      `AI Use` == FALSE ~ "Manual Coding",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  rename(Group = group) %>%
+  mutate(Group = toupper(Group)) %>%
+  mutate(`AI Use` = factor(`AI Use`, levels = c("Manual Coding", "AI-Assisted Coding")))
+
+coding_speed_hline_df <- coding_speed_df %>%
+  group_by(`AI Use`) %>%
+  summarise(mean_time = mean(time, na.rm = TRUE))
+
+p2 <- ggplot(coding_speed_df, aes(x = order, y = time, color = Group)) +
+  geom_point(alpha = 0.05, size = 1.2) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    linewidth = 1
+  ) +
+  geom_hline(
+    data = coding_speed_hline_df,
+    aes(yintercept = mean_time),
+    color = "black",
+    linetype = "22",
+    linewidth = 0.5
+  ) +
+  geom_text(
+    data = coding_speed_hline_df,
+    aes(
+      x = Inf,
+      y = mean_time,
+      label = paste0("Mean = ", round(mean_time, 1), " s")
+    ),
+    hjust = 1.1,
+    # pull slightly inside right edge
+    vjust = -0.4,
+    # place just above line
+    inherit.aes = FALSE,
+    size = 4.5
+  ) +
+  facet_grid(~`AI Use`) +
+  scale_y_continuous(
+    trans = scales::log_trans(base = exp(1)),
+    #  better than log(time) in aes
+    labels = label_number(accuracy = 1)
+  ) +
+  scale_color_manual(values = csu_palette_3) +
+  labs(
+    # title = "Coding Speed Over Time",
+    # subtitle = "Log-scaled time; dashed line indicates mean within facet",
+    x = "Coding Order",
+    y = "Coding Time [seconds, log scale]",
+    color = "Group"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(face = "bold", size = 22),
+    plot.subtitle = element_text(size = 16, margin = margin(b = 10)),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14, color = "black"),
+    strip.text = element_text(face = "bold", size = 16),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 14),
+    panel.grid = element_blank(),
+    panel.spacing.x = unit(0.8, "lines") # matches your histogram tuning
+  )
+
+p2
+
+ggsave(
+  "../plots/time_plot.png",
+  plot = p2,
+  width = 8,
+  height = 8,
+  # <-- increase this
+  dpi = 300
+)
+```
+
+Creates an exploratory LOESS learning-curve plot using the coder-level global task order.
+
+```{r plot-loess-learning-curve}
+# Explore a flexible coding-time trend across global task order.
+ggplot(
+  records_long,
+  aes(x = order_global, y = time, color = ai)
+) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "loess") +
+  facet_wrap(~group) +
+  labs(
+    title = "Learning Curve (Coding Time)",
+    x = "Task Order",
+    y = "Time (seconds)"
+  ) +
+  theme_minimal()
+```
+
+## 3. Jaccard Agreement Models
+
+### 3.1 Original boundary-adjusted beta model
+
+This section retains the original Smithson-Verkuilen-style boundary-adjusted beta mixed-effects analysis unchanged so that the original results remain reproducible.
+
+Moves Jaccard values away from exact zero and one so they can be modeled with a beta distribution.
+
+```{r transform-jaccard-beta}
+# Apply a standard boundary adjustment required for beta outcomes at 0 or 1.
+n <- nrow(jaccard_by_record_group)
+
+jaccard_by_record_group <- jaccard_by_record_group %>%
+  mutate(jaccard_beta = (jaccard_avg * (n - 1) + 0.5) / n)
+```
+
+Fits a beta mixed-effects model for Jaccard agreement with AI use, group, text length, and record-level random intercepts.
+
+```{r fit-jaccard-beta-model}
+# Model agreement while accounting for repeated group observations within records.
+fit_beta <- glmmTMB(
+  jaccard_beta ~ ai * group + text_length + (1 | record_id),
+  family = beta_family(),
+  data = jaccard_by_record_group
+)
+
+summary(fit_beta)
+```
+
+#### 3.1.1 Jaccard Model Diagnostics
+
+Evaluates the beta model with simulated residuals, residual plots, and model-fit summaries.
+
+```{r diagnose-jaccard-model}
+# Inspect residual behavior and summarize explanatory performance for the fitted beta model.
+sim_beta <- simulateResiduals(fit_beta)
+plot(sim_beta)
+
+qqnorm(residuals(fit_beta))
+qqline(residuals(fit_beta))
+
+beta_residuals_df <- data.frame(
+  fitted = fitted(fit_beta),
+  residuals = residuals(fit_beta)
+)
+
+ggplot(beta_residuals_df, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(se = FALSE, color = "red") +
+  labs(title = "Residuals vs Fitted") +
+  theme_minimal()
+
+performance::model_performance(fit_beta)
+
+# R2 (comparable metric)
+r2(fit_beta)
+```
+
+#### 3.1.2 Jaccard Model Inference
+
+Calculates estimated marginal means and Tukey-adjusted pairwise contrasts for the AI-by-group interaction.
+
+```{r estimate-jaccard-interaction}
+# Estimate all AI-use and coder-group combinations on the response scale.
+emm_beta <- emmeans(fit_beta, ~ ai * group, type = "response")
+
+pairs(emm_beta, adjust = "tukey")
+confint(pairs(emm_beta))
+```
+
+Prints the response-scale estimated marginal means for each AI-by-group combination.
+
+```{r summarize-jaccard-emmeans}
+# Display the interaction-level marginal mean estimates used for interpretation.
+summary(emm_beta)
+```
+
+Calculates response-scale marginal means and contrasts for AI use averaged across groups.
+
+```{r contrast-jaccard-ai}
+# Test the average AI-use contrast across coder groups.
+emm_beta_ai <- emmeans(fit_beta, ~ai, type = "response")
+summary(emm_beta_ai)
+pairs(emm_beta_ai)
+confint(pairs(emm_beta_ai))
+```
+
+Calculates response-scale marginal means and contrasts for coder group averaged across AI conditions.
+
+```{r contrast-jaccard-group}
+# Test pairwise coder-group differences averaged across AI-use conditions.
+emm_beta_group <- emmeans(fit_beta, ~group, type = "response")
+summary(emm_beta_group)
+pairs(emm_beta_group)
+```
+
+#### 3.1.3 Jaccard Model Visualization
+
+Plots and saves predicted Jaccard agreement and confidence intervals by group and AI use.
+
+```{r plot-jaccard-emmeans}
+# Convert response-scale estimated marginal means to a plotting data frame.
+# glmmTMB uses asymptotic confidence-limit names, which are standardized here
+# so the plotting code does not depend on model-specific column labels.
+plot_beta <- as.data.frame(summary(emm_beta, type = "response")) %>%
+  transmute(
+    ai,
+    group = toupper(group),
+    response,
+    lower.CL = asymp.LCL,
+    upper.CL = asymp.UCL
+  )
+
+p_jaccard_emmeans <- ggplot(
+  plot_beta,
+  aes(x = group, y = response, color = ai, group = ai)
+) +
+  # CI bars first so lines/points sit on top
+  geom_errorbar(
+    aes(ymin = lower.CL, ymax = upper.CL),
+    width = 0.12,
+    linewidth = 0.6
+  ) +
+  geom_line(
+    linewidth = 0.9
+  ) +
+  geom_point(
+    size = 3.2
+  ) +
+  # Optional: keep within Jaccard bounds (0–1) without chopping CIs off harshly
+  # coord_cartesian(ylim = c(0.4, 0.8), expand = FALSE) +
+  scale_x_discrete(expand = expansion(add = 0.1)) + # slight buffer (not 0 to avoid clipping)
+  coord_cartesian(ylim = c(0.4, 0.8), clip = "off") +
+  theme(plot.margin = margin(10, 20, 10, 10)) +
+  scale_y_continuous(
+    breaks = seq(0, 1, 0.1),
+    labels = function(x) sprintf("%.1f", x)
+  ) +
+  scale_color_manual(
+    values = csu_ai_colors,
+    breaks = c(FALSE, TRUE),
+    labels = c(
+      "Manual Coding",
+      "AI-Assisted Coding"
+    )
+  ) +
+  labs(
+    title = "Predicted Jaccard Agreement",
+    x = "Group",
+    y = "Predicted Jaccard Index",
+    color = "AI Use"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(face = "bold", size = 22),
+    plot.subtitle = element_text(size = 16, margin = margin(b = 10)),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14, color = "black"),
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 14),
+    panel.grid = element_blank(),
+    axis.text.x = element_text(margin = margin(t = 5))
+  )
+
+p_jaccard_emmeans
+
+ggsave(
+  "../plots/jaccard_emmeans.png",
+  plot = p_jaccard_emmeans,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+### 3.2 Zero-one-inflated beta sensitivity analysis
+
+This sensitivity analysis models the original, untransformed `jaccard_avg` outcome. The zero-one-inflated beta family represents three portions of the outcome distribution: an exact-zero mass, an exact-one mass, and a continuous beta distribution for values strictly between zero and one. In `brms`, `zoi` is the probability of being in either boundary mass, `coi` is the conditional probability that a boundary observation is one rather than zero, `mu` is the mean of the interior beta component, and `phi` is its precision. Therefore, the overall expected response is
+
+\[
+E(Y) = zoi \times coi + (1-zoi) \times mu.
+\]
+
+All marginal estimates below use `posterior_epred()`, which evaluates this full expected-response quantity rather than only the interior beta mean. Record-level random effects are excluded (`re_formula = NA`) to obtain population-level estimates, text length is held at its observed mean, and groups are equally weighted when an estimate is averaged across participant groups. This matches the equal-weighted reference-grid convention used by `emmeans` for the original model.
+
+```{r prepare-zoib-data}
+# Preserve the original logical AI coding and the established group reference order.
+zoib_data <- jaccard_by_record_group %>%
+  filter(
+    !is.na(jaccard_avg),
+    !is.na(ai),
+    !is.na(group),
+    !is.na(text_length),
+    !is.na(record_id)
+  ) %>%
+  mutate(
+    ai = factor(ai, levels = c(FALSE, TRUE)),
+    group = factor(group, levels = group_levels),
+    record_id = factor(record_id),
+    text_length_c = text_length - mean(text_length, na.rm = TRUE)
+  )
+
+if (any(zoib_data$jaccard_avg < 0 | zoib_data$jaccard_avg > 1)) {
+  stop("The untransformed Jaccard outcome must lie in [0, 1].")
+}
+
+cat("Exact zeroes:", sum(zoib_data$jaccard_avg == 0), "\n")
+cat("Exact ones:", sum(zoib_data$jaccard_avg == 1), "\n")
+cat("Interior observations:", sum(zoib_data$jaccard_avg > 0 & zoib_data$jaccard_avg < 1), "\n")
+```
+
+#### 3.2.1 Model specification and priors
+
+The population-level coefficients use Normal(0, 1.5) priors on the logit scale, with a slightly broader Normal(0, 2) prior for the intercept. The record random-intercept standard deviation uses a half-Student-t prior. Beta precision uses a Gamma(2, 0.1) prior. The zero/one inflation probability uses a Beta(1, 4) prior, which weakly regularizes the model toward boundary values being less common than interior values. The conditional probability that an inflated boundary value is one uses a uniform Beta(1, 1) prior.
+
+```{r specify-zoib-model-priors}
+zoib_formula <- bf(
+  jaccard_avg ~ ai * group + text_length_c + (1 | record_id)
+)
+
+zoib_priors <- c(
+  prior(normal(0, 2), class = "Intercept"),
+  prior(normal(0, 1.5), class = "b"),
+  prior(student_t(3, 0, 1), class = "sd", group = "record_id"),
+  prior(gamma(2, 0.1), class = "phi"),
+  prior(beta(1, 4), class = "zoi"),
+  prior(beta(1, 1), class = "coi")
+)
+
+cat("Priors supplied to the zero-one-inflated beta model:\n")
+print(zoib_priors)
+cat("\nPrior slots available for this model and installed brms version:\n")
+print(get_prior(
+  formula = zoib_formula,
+  data = zoib_data,
+  family = zero_one_inflated_beta()
+))
+```
+
+```{r fit-zoib-model, cache=TRUE}
+# Use cmdstanr when it is installed and configured; otherwise use brms/rstan.
+cmdstan_version <- if (requireNamespace("cmdstanr", quietly = TRUE)) {
+  tryCatch(cmdstanr::cmdstan_version(), error = function(e) NULL)
+} else {
+  NULL
+}
+brms_backend <- if (is.null(cmdstan_version)) "rstan" else "cmdstanr"
+cat("brms backend:", brms_backend, "\n")
+
+set.seed(20261028)
+fit_zoib <- brm(
+  formula = zoib_formula,
+  data = zoib_data,
+  family = zero_one_inflated_beta(),
+  prior = zoib_priors,
+  backend = brms_backend,
+  chains = 4,
+  cores = min(4, parallel::detectCores()),
+  iter = 4000,
+  warmup = 2000,
+  seed = 20261028,
+  control = list(adapt_delta = 0.97, max_treedepth = 15),
+  save_pars = save_pars(all = TRUE),
+  refresh = 200
+)
+print(summary(fit_zoib))
+```
+
+#### 3.2.2 Convergence and sampling diagnostics
+
+```{r diagnose-zoib-sampling}
+zoib_draws <- posterior::as_draws(fit_zoib)
+zoib_diagnostics <- posterior::summarise_draws(
+  zoib_draws,
+  "mean", "sd", "rhat", "ess_bulk", "ess_tail"
+)
+print(zoib_diagnostics)
+
+nuts_zoib <- brms::nuts_params(fit_zoib)
+n_divergent <- sum(
+  nuts_zoib$Parameter == "divergent__" & nuts_zoib$Value == 1
+)
+cat("Divergent transitions:", n_divergent, "\n")
+cat("Maximum R-hat:", max(zoib_diagnostics$rhat, na.rm = TRUE), "\n")
+cat("Minimum bulk ESS:", min(zoib_diagnostics$ess_bulk, na.rm = TRUE), "\n")
+cat("Minimum tail ESS:", min(zoib_diagnostics$ess_tail, na.rm = TRUE), "\n")
+
+plot(fit_zoib)
+```
+
+#### 3.2.3 Posterior predictive checks
+
+```{r zoib-posterior-predictive-checks, fig.height=6, fig.width=8}
+set.seed(20261028)
+yrep_zoib <- posterior_predict(fit_zoib, ndraws = 1000)
+y_obs_zoib <- zoib_data$jaccard_avg
+
+# Full outcome distribution, including the exact-zero and exact-one masses.
+pp_check(fit_zoib, type = "hist", ndraws = 100) +
+  labs(title = "Posterior predictive check: full Jaccard distribution")
+
+boundary_ppc <- tibble(
+  component = c("Exactly 0", "Exactly 1"),
+  observed = c(mean(y_obs_zoib == 0), mean(y_obs_zoib == 1)),
+  predicted_mean = c(mean(rowMeans(yrep_zoib == 0)), mean(rowMeans(yrep_zoib == 1))),
+  predicted_lower = c(
+    quantile(rowMeans(yrep_zoib == 0), 0.025),
+    quantile(rowMeans(yrep_zoib == 1), 0.025)
+  ),
+  predicted_upper = c(
+    quantile(rowMeans(yrep_zoib == 0), 0.975),
+    quantile(rowMeans(yrep_zoib == 1), 0.975)
+  )
+)
+knitr::kable(boundary_ppc, digits = 3,
+             caption = "Observed and posterior-predicted boundary proportions")
+
+# Compare only the continuous interior after removing exact boundary values.
+set.seed(20261028)
+interior_draw_ids <- sort(sample(seq_len(nrow(yrep_zoib)), min(100, nrow(yrep_zoib))))
+interior_ppc_df <- purrr::map_dfr(interior_draw_ids, function(i) {
+  vals <- yrep_zoib[i, ]
+  tibble(draw = factor(i), value = vals[vals > 0 & vals < 1])
+})
+interior_obs_df <- tibble(value = y_obs_zoib[y_obs_zoib > 0 & y_obs_zoib < 1])
+
+ggplot() +
+  geom_density(
+    data = interior_ppc_df,
+    aes(x = value, group = draw),
+    color = "grey65", alpha = 0.15, linewidth = 0.35
+  ) +
+  geom_density(
+    data = interior_obs_df,
+    aes(x = value),
+    color = "black", linewidth = 1.1
+  ) +
+  coord_cartesian(xlim = c(0, 1)) +
+  labs(
+    title = "Posterior predictive check: continuous interior",
+    subtitle = "Black = observed; gray = posterior predictive draws",
+    x = "Jaccard index conditional on 0 < Jaccard < 1",
+    y = "Density"
+  ) +
+  theme_classic()
+```
+
+#### 3.2.4 Coefficients and full-distribution marginal estimates
+
+```{r zoib-coefficients}
+zoib_coef_draws <- posterior::as_draws_df(fit_zoib)
+coef_names <- grep(
+  "(^b_)|(^phi$)|(^zoi$)|(^coi$)",
+  names(zoib_coef_draws),
+  value = TRUE
+)
+zoib_coefficients <- purrr::map_dfr(coef_names, function(term) {
+  x <- zoib_coef_draws[[term]]
+  tibble(
+    term = term,
+    estimate = mean(x),
+    lower_95 = quantile(x, 0.025),
+    upper_95 = quantile(x, 0.975),
+    probability_positive = mean(x > 0)
+  )
+})
+knitr::kable(
+  zoib_coefficients,
+  digits = 3,
+  caption = "Zero-one-inflated beta model coefficients with 95% credible intervals"
+)
+```
+
+```{r zoib-marginal-estimates}
+# posterior_epred() returns E(Y), combining exact-zero, exact-one, and interior-beta components.
+zoib_reference_grid <- tidyr::expand_grid(
+  ai = factor(c(FALSE, TRUE), levels = c(FALSE, TRUE)),
+  group = factor(group_levels, levels = group_levels)
+) %>%
+  mutate(
+    text_length_c = 0,
+    record_id = zoib_data$record_id[1]
+  )
+
+zoib_epred_grid <- posterior_epred(
+  fit_zoib,
+  newdata = zoib_reference_grid,
+  re_formula = NA
+)
+
+summarize_posterior <- function(x) {
+  tibble(
+    estimate = mean(x),
+    lower_95 = quantile(x, 0.025),
+    upper_95 = quantile(x, 0.975),
+    probability_positive = mean(x > 0)
+  )
+}
+
+zoib_group_condition <- bind_cols(
+  zoib_reference_grid %>% select(ai, group),
+  tibble(
+    estimate = apply(zoib_epred_grid, 2, mean),
+    lower_95 = apply(zoib_epred_grid, 2, quantile, probs = 0.025),
+    upper_95 = apply(zoib_epred_grid, 2, quantile, probs = 0.975)
+  )
+)
+knitr::kable(
+  zoib_group_condition,
+  digits = 3,
+  caption = "Condition-specific expected Jaccard within participant group"
+)
+
+manual_cols <- which(zoib_reference_grid$ai == FALSE)
+ai_cols <- which(zoib_reference_grid$ai == TRUE)
+zoib_manual_draw <- rowMeans(zoib_epred_grid[, manual_cols, drop = FALSE])
+zoib_ai_draw <- rowMeans(zoib_epred_grid[, ai_cols, drop = FALSE])
+
+zoib_condition_marginal <- bind_rows(
+  summarize_posterior(zoib_manual_draw) %>% mutate(ai = factor(FALSE, levels = c(FALSE, TRUE))),
+  summarize_posterior(zoib_ai_draw) %>% mutate(ai = factor(TRUE, levels = c(FALSE, TRUE)))
+) %>%
+  select(ai, everything())
+knitr::kable(
+  zoib_condition_marginal,
+  digits = 3,
+  caption = "Condition-specific marginal expected Jaccard, equally averaged across groups"
+)
+
+zoib_overall_ai_contrast_draw <- zoib_ai_draw - zoib_manual_draw
+zoib_overall_ai_contrast <- summarize_posterior(zoib_overall_ai_contrast_draw) %>%
+  mutate(contrast = "AI-assisted minus manual") %>%
+  select(contrast, everything())
+knitr::kable(
+  zoib_overall_ai_contrast,
+  digits = 3,
+  caption = "Overall AI-assisted versus manual contrast"
+)
+
+# AI-minus-manual condition effect within each participant group.
+zoib_group_contrast_draws <- sapply(seq_along(group_levels), function(g) {
+  zoib_epred_grid[, ai_cols[g]] - zoib_epred_grid[, manual_cols[g]]
+})
+colnames(zoib_group_contrast_draws) <- group_levels
+zoib_group_contrasts <- purrr::map_dfr(group_levels, function(g) {
+  summarize_posterior(zoib_group_contrast_draws[, g]) %>% mutate(group = g)
+}) %>%
+  select(group, everything())
+knitr::kable(
+  zoib_group_contrasts,
+  digits = 3,
+  caption = "AI-assisted minus manual contrast within each participant group"
+)
+
+# Difference-in-differences: pairwise comparisons of the group-specific AI effects.
+interaction_pairs <- combn(group_levels, 2, simplify = FALSE)
+zoib_interaction_contrasts <- purrr::map_dfr(interaction_pairs, function(pair) {
+  draw <- zoib_group_contrast_draws[, pair[1]] - zoib_group_contrast_draws[, pair[2]]
+  summarize_posterior(draw) %>%
+    mutate(contrast = paste0("AI effect: ", pair[1], " minus ", pair[2]))
+}) %>%
+  select(contrast, everything())
+knitr::kable(
+  zoib_interaction_contrasts,
+  digits = 3,
+  caption = "Condition-by-group interaction contrasts"
+)
+```
+
+#### 3.2.5 Comparison with the original boundary-adjusted beta model
+
+```{r compare-beta-and-zoib}
+# Original-model estimates are retained on their response scale.
+beta_group_df <- as.data.frame(summary(emm_beta, type = "response"))
+beta_ai_df <- as.data.frame(summary(emm_beta_ai, type = "response"))
+
+beta_manual <- beta_ai_df$response[as.character(beta_ai_df$ai) == "FALSE"]
+beta_ai <- beta_ai_df$response[as.character(beta_ai_df$ai) == "TRUE"]
+
+comparison_overall <- bind_rows(
+  tibble(
+    model = "Original boundary-adjusted beta",
+    manual = beta_manual,
+    ai_assisted = beta_ai,
+    relative_percent_change = 100 * (beta_ai - beta_manual) / beta_manual
+  ),
+  tibble(
+    model = "Zero-one-inflated beta",
+    manual = mean(zoib_manual_draw),
+    ai_assisted = mean(zoib_ai_draw),
+    relative_percent_change = mean(100 * (zoib_ai_draw - zoib_manual_draw) / zoib_manual_draw)
+  )
+)
+knitr::kable(
+  comparison_overall,
+  digits = 2,
+  caption = "Overall original-model and zero-one-inflated-model estimates"
+)
+
+comparison_group <- beta_group_df %>%
+  transmute(
+    model = "Original boundary-adjusted beta",
+    group = as.character(group),
+    condition = if_else(as.character(ai) == "TRUE", "AI-assisted", "Manual"),
+    estimate = response
+  ) %>%
+  bind_rows(
+    zoib_group_condition %>%
+      transmute(
+        model = "Zero-one-inflated beta",
+        group = as.character(group),
+        condition = if_else(as.character(ai) == "TRUE", "AI-assisted", "Manual"),
+        estimate
+      )
+  ) %>%
+  arrange(group, condition, model)
+knitr::kable(
+  comparison_group,
+  digits = 3,
+  caption = "Group-specific manual and AI-assisted estimates by model"
+)
+```
+
+#### 3.2.6 Automatically generated sensitivity interpretation
+
+```{r interpret-zoib-sensitivity, results='asis'}
+beta_ai_difference <- beta_ai - beta_manual
+zoib_ai_difference <- mean(zoib_overall_ai_contrast_draw)
+zoib_ai_ci <- quantile(zoib_overall_ai_contrast_draw, c(0.025, 0.975))
+zoib_prob_positive <- mean(zoib_overall_ai_contrast_draw > 0)
+
+direction_changed <- sign(beta_ai_difference) != sign(zoib_ai_difference)
+absolute_change <- abs(zoib_ai_difference - beta_ai_difference)
+relative_magnitude_change <- if (abs(beta_ai_difference) > .Machine$double.eps) {
+  abs(zoib_ai_difference / beta_ai_difference - 1)
+} else {
+  Inf
+}
+
+# Predeclared rule: material change = direction reversal, >=0.05 absolute Jaccard
+# difference, or >=25% change in the estimated AI-effect magnitude.
+material_change <- direction_changed || absolute_change >= 0.05 || relative_magnitude_change >= 0.25
+
+interpretation_text <- paste0(
+  "The zero-one-inflated beta sensitivity analysis estimated an overall AI-assisted minus manual difference of ",
+  sprintf("%.3f", zoib_ai_difference),
+  " (95% credible interval ", sprintf("%.3f", zoib_ai_ci[1]), " to ",
+  sprintf("%.3f", zoib_ai_ci[2]), "; posterior probability of a positive AI effect = ",
+  sprintf("%.3f", zoib_prob_positive), "). The original boundary-adjusted beta model estimated a difference of ",
+  sprintf("%.3f", beta_ai_difference), ". Under the prespecified comparison rule (direction reversal, an absolute change of at least 0.05 Jaccard units, or at least a 25% change in effect magnitude), the sensitivity analysis ",
+  ifelse(material_change, "materially changes", "does not materially change"),
+  " the direction or magnitude of the primary AI-assistance finding."
+)
+cat(interpretation_text)
+```
+
+## 4. Coding Time Model
+
+Fits a linear mixed-effects model for log coding time with coder and record random intercepts.
+
+```{r fit-time-lmm}
+# Model log-transformed duration while accounting for repeated observations by coder and record.
+# Log transformation requires every modeled coding-time value to be strictly positive.
+if (any(records_long$time <= 0, na.rm = TRUE)) {
+  stop("Coding time contains zero or negative values and cannot be log-transformed.")
+}
+
+fit_time <- lmer(
+  log(time) ~ ai * group + order_global + text_length +
+    (1 | coder) + (1 | record_id),
+  data = records_long,
+  REML = TRUE
+)
+
+summary(fit_time)
+anova(fit_time, type = 3)
+```
+
+### 5.1 Coding Time Model Diagnostics
+
+Evaluates the coding-time model with residual diagnostics and model-fit summaries.
+
+```{r diagnose-time-model}
+# Inspect duration-model residuals
+sim_time <- simulateResiduals(fit_time)
+plot(sim_time)
+
+qqnorm(residuals(fit_time))
+qqline(residuals(fit_time))
+
+time_residuals_df <- data.frame(
+  fitted = fitted(fit_time),
+  residuals = residuals(fit_time)
+)
+
+ggplot(time_residuals_df, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(se = FALSE, color = "red") +
+  labs(title = "Residuals vs Fitted") +
+  theme_minimal()
+
+performance::model_performance(fit_time)
+
+# R2 (comparable metric)
+r2(fit_time)
+```
+
+### 5.2 Coding Time Model Inference
+
+Calculates response-scale estimated marginal means and Tukey-adjusted contrasts for the time-model interaction.
+
+```{r estimate-time-interaction}
+# Estimate interaction-level coding times and multiplicity-adjusted contrasts.
+emm_time <- emmeans(fit_time, ~ ai * group, type = "response")
+pairs(emm_time, adjust = "tukey")
+confint(pairs(emm_time))
+```
+
+Prints the response-scale estimated marginal means from the coding-time model.
+
+```{r summarize-time-emmeans}
+# Display the interaction-level time estimates used for interpretation.
+summary(emm_time)
+```
+
+Calculates response-scale marginal means and contrasts for AI use in the coding-time model.
+
+```{r contrast-time-ai}
+# Test the average AI-use contrast for coding time.
+emm_time_ai <- emmeans(fit_time, ~ai, type = "response")
+summary(emm_time_ai)
+pairs(emm_time_ai)
+confint(pairs(emm_time_ai))
+```
+
+### 5.3 Coding-Time Model Visualization
+
+Plots and saves predicted coding time and confidence intervals by group and AI use.
+
+```{r plot-time-emmeans}
+# Convert response-scale estimated marginal means to a plotting data frame.
+# lmer confidence limits are retained under standardized names for consistency
+# with the Jaccard prediction data used in the combined figure.
+# Request response-scale estimates and confidence intervals explicitly.
+plot_time <- as.data.frame(
+  confint(emm_time, type = "response")
+)
+
+# Identify the confidence-limit names returned by the installed emmeans
+# version and the degrees-of-freedom method used for this model.
+lower_ci_col <- intersect(
+  c("lower.CL", "asymp.LCL"),
+  names(plot_time)
+)
+
+upper_ci_col <- intersect(
+  c("upper.CL", "asymp.UCL"),
+  names(plot_time)
+)
+
+# Stop with an informative error if confidence limits are unavailable.
+if (length(lower_ci_col) == 0 || length(upper_ci_col) == 0) {
+  stop(
+    "Confidence-limit columns were not found. Available columns are: ",
+    paste(names(plot_time), collapse = ", ")
+  )
+}
+
+# Standardize the confidence-limit names for downstream plotting.
+plot_time <- plot_time %>%
+  transmute(
+    ai,
+    group = toupper(group),
+    response,
+    lower.CL = .data[[lower_ci_col[1]]],
+    upper.CL = .data[[upper_ci_col[1]]]
+  )
+
+p_time_emmeans <- ggplot(
+  plot_time,
+  aes(x = group, y = response, color = ai, group = ai)
+) +
+  # CI bars first so lines/points sit on top
+  geom_errorbar(
+    aes(ymin = lower.CL, ymax = upper.CL),
+    width = 0.12,
+    linewidth = 0.6
+  ) +
+  geom_line(
+    linewidth = 0.9
+  ) +
+  geom_point(
+    size = 3.2
+  ) +
+  # Optional: keep within Jaccard bounds (0–1) without chopping CIs off harshly
+  # coord_cartesian(ylim = c(0.4, 0.8), expand = FALSE) +
+  scale_x_discrete(expand = expansion(add = 0.1)) + # slight buffer (not 0 to avoid clipping)
+  # coord_cartesian(ylim = c(0.4, 0.8), clip = "off") +
+  theme(plot.margin = margin(10, 20, 10, 10)) +
+  # scale_y_continuous(
+  #   # breaks = seq(0, 1, 0.1),
+  #   labels = function(x) sprintf("%.1f", x)
+  # ) +
+  scale_color_manual(
+    values = csu_ai_colors,
+    breaks = c(FALSE, TRUE),
+    labels = c(
+      "Manual Coding",
+      "AI-Assisted Coding"
+    )
+  ) +
+  labs(
+    title = "Predicted Coding Time",
+    x = "Group",
+    y = "Estimated Geometric Mean Time [seconds]",
+    color = "AI Use"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(face = "bold", size = 22),
+    plot.subtitle = element_text(size = 16, margin = margin(b = 10)),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14, color = "black"),
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 14),
+    panel.grid = element_blank(),
+    axis.text.x = element_text(margin = margin(t = 5))
+  )
+
+p_time_emmeans
+
+ggsave(
+  "../plots/time_emmeans.png",
+  plot = p_time_emmeans,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## 5. Misc Plots for Poster
+
+Recreates the Jaccard and time prediction panels and saves them as a combined figure with a shared legend.
+
+```{r combine-model-plots}
+# Assemble publication-style model panels
+# --- Plot 1: Jaccard ---
+p_beta <- ggplot(
+  plot_beta,
+  aes(x = group, y = response, color = ai, group = ai)
+) +
+  geom_errorbar(
+    aes(ymin = lower.CL, ymax = upper.CL),
+    width = 0.12, linewidth = 0.6
+  ) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 3.2) +
+  scale_x_discrete(expand = expansion(add = 0.15)) +
+  coord_cartesian(ylim = c(0.4, 0.8), clip = "off") +
+  scale_y_continuous(
+    breaks = seq(0, 1, 0.1),
+    labels = function(x) sprintf("%.1f", x)
+  ) +
+  scale_color_manual(
+    values = csu_ai_colors,
+    breaks = c(FALSE, TRUE),
+    labels = c(
+      "Manual Coding",
+      "AI-Assisted Coding"
+    )
+  ) +
+  labs(
+    title = "Predicted Jaccard\nAgreement",
+    x = "Group",
+    y = "Predicted Jaccard Index",
+    color = "AI Use"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.margin = margin(10, 5, 12, 10), # more bottom space
+    plot.title = element_text(face = "bold", size = 18, margin = margin(b = 5)),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14, color = "black"),
+    axis.text.x = element_text(margin = margin(t = 8)), # separate labels
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 14)
+  )
+
+# --- Plot 2: Time ---
+p_time <- ggplot(
+  plot_time,
+  aes(x = group, y = response, color = ai, group = ai)
+) +
+  geom_errorbar(
+    aes(ymin = lower.CL, ymax = upper.CL),
+    width = 0.12, linewidth = 0.6
+  ) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 3.2) +
+  scale_x_discrete(expand = expansion(add = 0.4)) +
+  scale_color_manual(
+    values = csu_ai_colors,
+    breaks = c(FALSE, TRUE),
+    labels = c(
+      "Manual Coding",
+      "AI-Assisted Coding"
+    )
+  ) +
+  labs(
+    title = "Predicted Coding\nTime",
+    x = "Group",
+    y = "Predicted Time [sec]", #  restored
+    color = "AI Use"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.margin = margin(10, 40, 12, 5), #  BIG right margin (fix clipping)
+    plot.title = element_text(face = "bold", size = 18, margin = margin(b = 5)),
+    axis.title = element_text(size = 18),
+    axis.title.y = element_text(margin = margin(r = 12)), #  push label outward
+    axis.text = element_text(size = 14, color = "black"),
+    axis.text.x = element_text(margin = margin(t = 8)), #  prevent overlap
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 14)
+  )
+
+# --- Combine with spacer (KEY FIX) ---
+combined <- (p_beta | plot_spacer() | p_time) +
+  plot_layout(
+    widths = c(1.05, 0.06, 1.25), #  small gap between panels
+    guides = "collect"
+  ) &
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.key.width = unit(1.1, "lines"),
+    legend.spacing.x = unit(0.4, "lines"),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+combined
+
+ggsave(
+  "../plots/combined.png",
+  plot = combined,
+  # <-- increase this
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+Builds and saves a bar chart of manually entered GatorTron performance metrics and confidence intervals.
+
+```{r plot-gatortron-metrics}
+# Visualize externally supplied model-performance values; these values are hard-coded rather than calculated above.
+gatortron_metrics_df <- tibble::tribble(
+  ~Metric, ~Estimate, ~CI_half,
+  "F1", 76.9, 0.14,
+  "Precision", 81.5, 1.74,
+  "Recall", 74.4, 1.14,
+  "Exact Match", 52.2, 0.66
+) %>%
+  mutate(
+    CI_low  = Estimate - CI_half,
+    CI_high = Estimate + CI_half,
+    Metric  = factor(Metric, levels = Metric)
+  )
+
+p_bar <- ggplot(gatortron_metrics_df, aes(x = Metric, y = Estimate, fill = Metric)) +
+  geom_col(width = 0.65, color = "white", linewidth = 0.4) +
+  geom_errorbar(
+    aes(ymin = CI_low, ymax = CI_high),
+    width = 0.12,
+    linewidth = 0.9
+  ) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", Estimate)),
+    vjust = -2.75,
+    size = 5,
+    color = "black",
+    fontface = "bold"
+  ) +
+  geom_text(
+    aes(label = sprintf("[%.1f, %.1f]", CI_low, CI_high)),
+    vjust = -2.0, size = 4
+  ) +
+  scale_y_continuous(
+    breaks = seq(50, 100, 10),
+    labels = function(x) sprintf("%.0f%%", x)
+  ) +
+  coord_cartesian(ylim = c(50, 100), expand = FALSE) +
+  scale_fill_manual(values = csu_palette_4) +
+  labs(
+    title = "GatorTron Model Performance",
+    x = NULL,
+    y = "Score"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(face = "bold", size = 22),
+    plot.subtitle = element_text(size = 16, margin = margin(b = 10)),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16, color = "black"),
+    axis.text.x = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+p_bar
+
+ggsave(
+  "../plots/metrics.png",
+  plot = p_bar,
+  # <-- increase this
+  dpi = 300
+)
+```
