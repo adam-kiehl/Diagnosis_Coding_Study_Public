@@ -1421,7 +1421,8 @@ p_bar <- ggplot(gatortron_metrics_df, aes(x = Metric, y = Estimate, fill = Metri
     axis.title = element_text(size = 18),
     axis.text = element_text(size = 16, color = "black"),
     axis.text.x = element_text(face = "bold"),
-    panel.grid = element_blank()
+    panel.grid = element_blank(),
+    legend.position = "none"
   )
 
 p_bar
